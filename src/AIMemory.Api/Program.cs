@@ -61,6 +61,21 @@ else
 Directory.CreateDirectory(programDataConfigDir);
 File.WriteAllText(portFilePath, configuredPort.ToString());
 
+// runtime.json — the canonical "where is the API?" file the Tauri shell and MCP server
+// read on startup. Contains baseUrl + apiKey + port. The apiKey field is filled in
+// later, after we've confirmed the desktop key exists in the api_keys table; for now
+// we write a placeholder so the file is discoverable. Phase 4 will key-init this on
+// the first boot if the desktop key row is missing.
+var runtimeJsonPath = Path.Combine(programDataConfigDir, "runtime.json");
+var legacyApiKey = Environment.GetEnvironmentVariable("AIMEMORY_API_KEY") ?? "";
+File.WriteAllText(runtimeJsonPath,
+    System.Text.Json.JsonSerializer.Serialize(new
+    {
+        baseUrl = $"http://127.0.0.1:{configuredPort}",
+        apiKey = legacyApiKey,
+        port = configuredPort
+    }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+
 // NLog
 builder.Logging.ClearProviders();
 builder.Host.UseNLog();

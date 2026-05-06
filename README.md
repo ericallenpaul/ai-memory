@@ -1,310 +1,224 @@
 # ai-memory
 
-ai-memory is a cross-platform LLM work ledger and code index. It tracks prompts, sessions, tool calls, and artifacts across AI assistants (Claude, OpenAI, local models), and maintains a structured, queryable index of your codebases. It is designed for power users who want durable memory across agentic workflows without repeating work.
+ai-memory is a local code intelligence platform for AI agents. It indexes source repositories
+into a SQLite database, exposes a structured query surface over HTTP and the Model Context
+Protocol (MCP), and ships a Tauri desktop control panel for managing it. The goal: replace
+expensive "load the whole file into context" patterns with precise, low-token symbol queries.
+
+> **Status:** Active migration. As of 2026-05-03 the project is converging on a code-indexer-only
+> scope; transcript ingestion (Claude Code, Codex CLI) is parked but not deleted. See
+> [`code_indexer_mcp_system_prd.md`](./code_indexer_mcp_system_prd.md) for the product vision and
+> [`.claude/memory-bank/main/plans/main-2026-05-03-tauri-code-indexer.md`](./.claude/memory-bank/main/plans/main-2026-05-03-tauri-code-indexer.md)
+> for the multi-phase migration plan.
 
 ---
 
 ## Architecture
 
 ```
-+--------------------------+       +---------------------------+
-|  Claude Code / Codex CLI |       |  Claude Desktop / MCP     |
-|  (local, file-based)     |       |  client                   |
-+----------+---------------+       +------------+--------------+
-           |                                    |
-           v                                    v
-+----------+---------------+       +------------+--------------+
-|  AIMemory.Ingestor         |       |  AIMemory.Mcp              |
-|  - Claude Code adapter    |       |  - Session tools          |
-|  - Code adapter           | ----> |  - Code tools             |
-|  - Checkpoint store       |       +------------+--------------+
-|  - Batch + retry queue    |                    |
-+----------+---------------+                    |
-           |                                    |
-           v                                    v
-+----------+----------------------------------------------------+
-|  AIMemory.Api  (ASP.NET Core minimal API)                      |
-|                                                               |
-|  /api/sessions    /api/ingest/batch    /api/code/*            |
-|  /api/search      /api/keys            /api/stats             |
-|                                                               |
-|  Auth: cookie (web UI) + API key (ingestor / MCP)             |
-|  Rate limiting: fixed window (general), sliding (search)      |
-+-----------------+---------------------------------------------+
-                  |
-                  v
-+------------------+------------------+
-|  Database (EF Core)                  |
-|  SQLite (dev / first run)            |
-|  PostgreSQL (production)             |
-+--------------------------------------+
-                  ^
-                  |
-+------------------+
-|  AIMemory.Client   |
-|  React + Vite SPA |
-|  (embedded in API)|
-+------------------+
+┌──────────────────────────────┐         ┌────────────────────────────┐
+│  Tauri Desktop  (per-user)   │         │  Claude Code / IDE         │
+│  React + Vite + Rust shell   │         │     │ launches per session │
+│  - Controls Windows Services │         │     ▼                      │
+│  - Reads runtime.json        │         │  aimemory-mcp.exe (stdio)  │
+└────────────┬─────────────────┘         └────────────┬───────────────┘
+             │ HTTP + X-API-Key                       │ HTTP + X-API-Key
+             ▼                                        ▼
+   ┌───────────────────────────────────────────────────────────────┐
+   │  Windows Service: aimemory-api  (always running)              │
+   │  ASP.NET Core minimal API on 127.0.0.1:5219                   │
+   │  Writes %ProgramData%\AIMemory\Api\runtime.json on startup    │
+   └─────────────────────────────┬─────────────────────────────────┘
+                                 │ POST /api/ingest/batch
+                                 │
+   ┌─────────────────────────────┴─────────────────────────────────┐
+   │  Windows Service: aimemory-ingestor  (always running)         │
+   │  - Git tier-0 (libgit2) for changed-file detection            │
+   │  - mtime/size/hash fallback for non-git folders               │
+   │  - Per-file delete events for git deletes                     │
+   │  - End-of-cycle reconciliation for FS-mode deletions          │
+   └─────────────────────────────┬─────────────────────────────────┘
+                                 │
+                                 ▼
+                       SQLite (WAL) — %ProgramData%\AIMemory\db\aimemory.db
 ```
+
+The .NET binaries run as OS services, so indexing keeps happening when the desktop UI is
+closed and Claude can call MCP tools at any time. The Tauri shell is a control panel for the
+services, not their host.
 
 ---
 
-## Projects
+## Repository layout
 
-| Project | Description |
+| Path | What |
 |---|---|
-| `AIMemory.Api` | ASP.NET Core minimal API. Hosts the REST API and serves the React SPA. |
-| `AIMemory.Data` | EF Core DbContext, migrations, and repositories. SQLite + PostgreSQL dual provider. |
-| `AIMemory.Models` | Shared entity and DTO types. |
-| `AIMemory.Ingestor` | Local background agent. Reads Claude Code and code repositories, batches and pushes events to the API. |
-| `AIMemory.Ingestor.Installer` | Windows installer / service registration for the ingestor. |
-| `AIMemory.Ingestor.ConfigApp` | Desktop configuration utility for the ingestor. |
-| `AIMemory.Mcp` | MCP server. Thin wrapper that exposes session and code tools over the Model Context Protocol. |
-| `AIMemory.CodeIndex` | Code parsing library. Language parsers (C#, Python, TypeScript, Go) plus file filtering. |
-| `aimemory.client` | React + Vite SPA. Also embedded under `AIMemory.Api/clientapp/`. |
+| `apps/desktop/` | Tauri 2.x desktop control panel. React+Vite frontend, Rust shell with windows-service control. |
+| `src/AIMemory.Api/` | ASP.NET Core minimal API. Hosts `/api/code/*`, `/api/admin/tables/*`, `/api/ingestor/*`, plus the (parked) session/search endpoints. |
+| `src/AIMemory.Ingestor/` | Worker service. Code adapter with three-tier change detection plus libgit2 tier-0. Runs as `aimemory-ingestor` Windows Service. |
+| `src/AIMemory.CodeIndex/` | Parser library (C#, Python, TypeScript, Go), file filter, libgit2-backed `GitChangeDetector`. |
+| `src/AIMemory.Mcp/` | MCP stdio server. Exposes `IndexFolder`, `SearchSymbols`, `GetSymbol`, etc. Reads `runtime.json` to discover the API. |
+| `src/AIMemory.Models/` | Shared entities, DTOs, ingestion events (`CodeFileUpsertEvent`, `CodeFileDeleteEvent`, `CodeSymbolBatchEvent`, ...). |
+| `src/AIMemory.Data/` | EF Core DbContext + repositories. SQLite default; PostgreSQL provider available but not used in the desktop bundle. |
+| `src/AIMemory.Ingestor.ConfigApp/` | **Retired.** WPF Windows-only configuration utility, superseded by `apps/desktop/`. |
+| `src/aimemory.client/` | **Retired (for active development).** React+Vite web SPA, kept as reference. The Tauri shell replaces it. |
+| `tests/AIMemory.Tests.Unit/` | 203 unit tests (xUnit). Covers parsers, file filter, code adapter (with git mode), git change detector, and API key repo. |
+| `tests/AIMemory.Tests.Integration/` | Smoke tests against the developer's actual repo dir (skipped automatically when paths don't exist). |
 
 ---
 
-## Key Features
+## Prerequisites
 
-### Session Tracking
-- Create and retrieve named sessions scoped to project, repo, and branch.
-- Append messages (user / assistant / system / tool), tool calls, and artifacts.
-- Full-text search across sessions by content, project, or source.
-- Cost and token telemetry per message.
-
-### Code Indexing
-- Index local folders or repositories by pointing the ingestor at them.
-- Parses symbols (functions, classes, methods, interfaces, structs, properties, enums) from C#, Python, TypeScript, and Go source files.
-- Retrieves source by byte offset — surgical reads rather than full-file loads.
-- Queryable via REST or MCP tools.
-
-### MCP Tools
-- Session tools: `create_session`, `append_message`, `append_tool_call`, `search`, `get_session`.
-- Code tools: `IndexFolder`, `ListCodeRepos`, `GetFileTree`, `GetFileOutline`, `GetRepoOutline`, `GetSymbol`, `GetSymbols`, `SearchSymbols`, `SearchCodeText`, `RemoveCodeRepo`.
-
-### API Key Management
-- Scoped keys: `ingest`, `code`, `mcp`, `admin`.
-- Keys are stored as SHA-256 hashes; only the prefix is retained for display.
-- 60-second in-memory cache for auth performance.
-- Optional expiry and last-used tracking.
-
-### Web UI Dashboard
-- Session browser with message history, tool calls, and artifacts.
-- Code repository browser with file tree and symbol outline views.
-- API key management.
-- Activity stats and daily charts.
-
-### First-Run Setup Wizard
-- No database required until wizard completes.
-- Creates admin user and writes configuration to `%ProgramData%\AIMemory\Api\`.
-- Supports SQLite (default) or PostgreSQL.
+- **.NET 10 SDK** — runtime is required by users; SDK by developers
+- **Node.js 20+** and npm
+- **Rust** (stable, MSVC toolchain) — only needed when building the Tauri shell
+- **Visual Studio Build Tools 2022** with the C++ workload — required by Rust's MSVC toolchain
+- **WebView2 Runtime** — ships with Windows 10/11
 
 ---
 
-## Getting Started
+## Quickstart (developer)
 
-### Prerequisites
+```powershell
+# 1. Restore + build everything
+dotnet build src/AIMemory.slnx
 
-- .NET 10 SDK
-- Node.js 20+ and npm
-- (Optional) PostgreSQL if not using the SQLite default
+# 2. Run all tests (203 unit + 6 integration smoke)
+dotnet test src/AIMemory.slnx
 
-### Build
-
-```bash
-cd src
-dotnet build AIMemory.slnx
-cd aimemory.client
-npm install
-```
-
-### Run (development)
-
-Open two terminals:
-
-```bash
-# Terminal 1 — API
+# 3. Run the API standalone (no Tauri yet)
 cd src/AIMemory.Api
 dotnet run
+# -> http://localhost:5219, writes runtime.json to %ProgramData%\AIMemory\Api\
 
-# Terminal 2 — React dev server
-cd src/aimemory.client
-npm run dev
+# 4. Run the ingestor against a folder (separate terminal)
+cd src/AIMemory.Ingestor
+dotnet run
+# -> reads %ProgramData%\AIMemory\Ingestor\appsettings.json for watch paths
+
+# 5. (Optional) Run the Tauri desktop control panel
+cd apps/desktop
+npm install
+npm run tauri dev
 ```
 
-The API listens on `http://localhost:5219`. The Vite dev server listens on `http://localhost:5173` and proxies `/api/*` requests to the API. Open `http://localhost:5173` in a browser.
+The Tauri app's Services page will show the .NET processes as "Not Installed" in dev mode
+(they're console processes, not registered services). It still talks to the API via the
+runtime.json the API writes.
 
-On first run, the setup wizard will prompt for credentials and database selection.
+## Quickstart (end user, when the installer ships)
 
-### Run (production)
-
-```bash
-cd src/AIMemory.Api
-dotnet publish -c Release -o ./publish
-# Copy aimemory.client/dist to publish/wwwroot
-cd publish
-dotnet AIMemory.Api.dll
+```
+1. Download AIMemory Desktop_<ver>_x64-setup.exe
+2. Run it. The installer detects .NET 10; prompts to install if missing.
+3. The installer registers `aimemory-api` and `aimemory-ingestor` as
+   Windows Services with start type Automatic.
+4. Both services start. AIMemory Desktop opens.
+5. Click "Add folder" to index a repository.
+6. (For Claude Code users) Register the MCP server:
+      claude mcp add aimemory "C:\Program Files\AIMemory Desktop\AIMemory.Mcp.exe"
 ```
 
 ---
 
-## Configuration
+## Change detection (Phase 1 highlight)
 
-### API (`AIMemory.Api`)
+The ingestor's code adapter has a layered change-detection pipeline:
 
-Configuration is written to `%ProgramData%\AIMemory\Api\appsettings.json` by the setup wizard or manually.
+| Layer | Mechanism | Runs when |
+|---|---|---|
+| **Tier 0 — Git** | `libgit2 diff` against last-seen HEAD + working-tree dirty list | Watch path is a git repo + `DetectionMode != FsOnly` |
+| **Tier 0 — FS walk** | `Directory.EnumerateFiles` + filter | Watch path is **not** a git repo, or `DetectionMode = FsOnly` |
+| **Tier 1** | `FileInfo.LastWriteTimeUtc` + `Length` vs checkpoint | Always |
+| **Tier 2** | SHA-256 content hash vs checkpoint | Tier 1 says "maybe changed" |
+| **Tier 3** | Language parser → symbols | Tier 2 confirms content actually differs |
+
+Worst case (no `.git` folder) is the previous mtime/size/hash behavior unchanged. Best case
+(clean git repo with one commit since last scan) is one libgit2 call returning a handful of
+changed paths.
+
+**Deletions:**
+- Git mode: libgit2 surfaces deletions via `git diff --diff-filter=D`. Per-file
+  `CodeFileDeleteEvent` emitted, API cascades to symbols.
+- FS mode: end-of-cycle sweep. Filesystem is the boss — anything in the previous scan's
+  enumerated set that's no longer on disk gets deleted.
+
+Configurable per source in `appsettings.json`:
 
 ```json
 {
-  "AIMemory": {
-    "DatabaseProvider": "SQLite",
-    "Port": 5219
-  },
-  "ConnectionStrings": {
-    "AIMemory": "Data Source=C:\\path\\to\\aimemory.db"
+  "Ingestor": {
+    "Sources": [
+      {
+        "Name": "code-index",
+        "Enabled": true,
+        "WatchPaths": ["C:\\Users\\you\\Source\\repos\\my-project"],
+        "DetectionMode": "Auto"
+      }
+    ]
   }
 }
 ```
 
-Environment variable override: `AIMEMORY_API_KEY` — acts as a legacy admin-scoped key (bypasses DB key lookup).
-
-### Ingestor (`AIMemory.Ingestor`)
-
-Config file: `aimemory.ingestor.json`
-
-```json
-{
-  "AIMemoryApiBaseUrl": "http://localhost:5219",
-  "ApiKey": "aimemory_...",
-  "ClientId": "my-machine-01",
-  "Sources": [
-    {
-      "Name": "claude-code",
-      "Enabled": true,
-      "AdapterType": "ClaudeCode",
-      "WatchPaths": [ "C:\\Users\\you\\.claude\\projects" ]
-    },
-    {
-      "Name": "code-index",
-      "Enabled": true,
-      "AdapterType": "Code",
-      "WatchPaths": [ "C:\\source\\repos\\MyProject" ]
-    }
-  ],
-  "ScanIntervalSeconds": 30,
-  "BatchSize": 100
-}
-```
-
-Environment variable overrides:
-- `AIMEMORY_API_URL`
-- `AIMEMORY_API_KEY`
-- `AIMEMORY_CLIENT_ID`
-
-### MCP (`AIMemory.Mcp`)
-
-The MCP server connects to the API using an API key with `mcp` or `admin` scope. Configure via environment variables or `appsettings.json` in the MCP project.
+`DetectionMode` accepts `"Auto"` (default), `"GitOnly"`, or `"FsOnly"`.
 
 ---
 
-## API Endpoints
-
-### Setup and Auth
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/setup/status` | Check whether setup wizard is needed |
-| POST | `/api/setup/init` | Complete first-run setup |
-| POST | `/api/auth/login` | Log in (sets cookie) |
-| POST | `/api/auth/logout` | Log out |
-| GET | `/api/auth/me` | Current user info |
-
-### Sessions
-
-| Method | Path | Description |
-|---|---|---|
-| POST | `/api/sessions` | Create a session |
-| GET | `/api/sessions` | List sessions (filterable by project, repo, source, tag, date range) |
-| GET | `/api/sessions/{id}` | Get session with messages, tool calls, and artifacts |
-| POST | `/api/sessions/{id}/messages` | Append a message |
-| POST | `/api/sessions/{id}/toolcalls` | Append a tool call |
-| POST | `/api/sessions/{id}/artifacts` | Append an artifact |
-
-### Search
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/search?q=...` | Full-text search across sessions |
-
-### Ingestion
-
-| Method | Path | Description |
-|---|---|---|
-| POST | `/api/ingest/batch` | Batch ingest events (SessionUpsert, MessageAppend, ToolCallAppend, ArtifactAppend, CodeFileUpsert, CodeSymbolBatch) |
-| GET | `/api/ingestion-log` | View ingestion history |
+## API Endpoints (used by the Tauri shell + MCP)
 
 ### Code Index
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/code/index-folder` | Index a local folder |
-| GET | `/api/code/repos` | List all indexed repositories |
-| GET | `/api/code/repos/{id}` | Get repository details |
-| DELETE | `/api/code/repos/{id}` | Remove a repository |
-| POST | `/api/code/repos/{id}/reindex` | Re-index a repository |
-| GET | `/api/code/repos/{id}/tree` | Get file tree |
-| GET | `/api/code/repos/{id}/outline` | Get repository or file symbol outline |
-| GET | `/api/code/repos/{id}/symbol?key=...` | Get a single symbol with source |
-| POST | `/api/code/repos/{id}/symbols` | Batch-get symbols |
-| GET | `/api/code/search/symbols?q=...` | Search symbols by name or qualified name |
-| GET | `/api/code/search/text?q=...` | Full-text search within indexed files |
+| POST | `/api/code/index-folder` | Index a local folder; returns repo info |
+| GET | `/api/code/repos` | List indexed repositories |
+| GET | `/api/code/repos/{id}/tree` | File tree |
+| GET | `/api/code/repos/{id}/outline?file=` | Symbol outline for a file |
+| GET | `/api/code/repos/{id}/symbol?key=` | Source slice for a symbol (byte-offset extract) |
+| GET | `/api/code/search/symbols?q=` | Search symbols by name |
+| DELETE | `/api/code/repos/{id}` | Remove repo from index |
+| POST | `/api/code/repos/{id}/reindex` | Force re-index |
 
-### API Key Management
+### Ingestion
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/keys` | List all API keys |
-| POST | `/api/keys` | Create a new API key |
-| GET | `/api/keys/{id}` | Get key details |
-| PATCH | `/api/keys/{id}` | Update name, scopes, or active status |
-| DELETE | `/api/keys/{id}` | Delete a key |
+| POST | `/api/ingest/batch` | Batch ingest events (CodeFileUpsert, CodeSymbolBatch, **CodeFileDelete**) |
+| GET | `/api/ingestor/recent` | Recent code-indexer events for the Tauri Services page |
 
-### Observability
+### Admin (Tauri DB browser)
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/health` | Database connectivity check |
-| GET | `/api/stats` | Session and message totals, daily activity (30 days) |
+| GET | `/api/admin/tables/{name}?limit=&offset=` | Whitelisted read-only inspector over `code_repositories`, `code_files`, `code_symbols`, `ingestion_log` |
+
+### Health / Stats
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/health` | DB connectivity check |
+| GET | `/api/stats` | Session and message totals |
 
 ---
 
-## MCP Tools
-
-### Session Tools
+## MCP Tools (for Claude Code, Codex, etc.)
 
 | Tool | Description |
 |---|---|
-| `create_session` | Create a named session |
-| `append_message` | Append a message to a session |
-| `append_tool_call` | Append a tool call record to a session |
-| `search` | Full-text search across session history |
-| `get_session` | Retrieve a session with its message history |
-
-### Code Tools
-
-| Tool | Description |
-|---|---|
-| `IndexFolder` | Index a local code folder; returns repo info with file and symbol counts |
+| `IndexFolder` | Index a local folder; returns repo info with file and symbol counts |
 | `ListCodeRepos` | List all indexed repositories |
-| `GetFileTree` | Get all files in a repository with language and size |
-| `GetFileOutline` | Get all symbols in a specific file |
-| `GetRepoOutline` | Get a high-level overview of a repository |
-| `GetSymbol` | Get the full source of a symbol by key (`filepath::QualifiedName#kind`) |
-| `GetSymbols` | Batch-retrieve multiple symbols by key array |
-| `SearchSymbols` | Search symbols by name with optional kind filter |
-| `SearchCodeText` | Full-text search within indexed source files |
-| `RemoveCodeRepo` | Delete a repository from the index |
+| `GetFileTree` | All files in a repo with language and size |
+| `GetFileOutline` | All symbols in a specific file |
+| `GetRepoOutline` | High-level overview of a repo |
+| `GetSymbol` | Full source of a symbol by key (`filepath::QualifiedName#kind`) — byte-offset extracted |
+| `GetSymbols` | Batch retrieval |
+| `SearchSymbols` | Search by name with optional kind filter |
+| `SearchCodeText` | Full-text search within indexed files |
+| `RemoveCodeRepo` | Delete a repo from the index |
+
+The MCP server reads `%ProgramData%\AIMemory\Api\runtime.json` on startup to find the local
+API. Override with `AIMEMORY_API_URL` and `AIMEMORY_API_KEY` env vars for non-desktop
+deployments.
 
 ---
 
@@ -312,22 +226,32 @@ The MCP server connects to the API using an API key with `mcp` or `admin` scope.
 
 | Layer | Technology |
 |---|---|
-| API | ASP.NET Core (.NET 10), minimal API |
-| ORM | Entity Framework Core 9 |
-| Database | SQLite (default), PostgreSQL |
-| Web UI | React 19, Vite 6, TypeScript |
+| API | ASP.NET Core 10 (minimal API) |
+| Hosting | Windows Service (`UseWindowsService`) + systemd (`UseSystemd`) — same code, both targets |
+| ORM | Entity Framework Core 10 |
+| Database | SQLite (default, WAL mode), PostgreSQL provider available |
+| Code parsing | Roslyn (C#), regex/line-based (Python, TypeScript, Go) |
+| Change detection | libgit2 via LibGit2Sharp 0.31 |
 | MCP | ModelContextProtocol .NET SDK |
-| Logging | NLog |
-| Auth | Cookie auth (web UI), API key (X-API-Key header) |
-| Tests | xUnit |
+| Desktop shell | Tauri 2.x (Rust shell, React 19 + Vite frontend, NSIS installer) |
+| Service control | `windows-service` Rust crate |
+| Tests | xUnit, Xunit.SkippableFact for live-fire smoke tests |
 
 ---
 
-## API Key Scopes
+## Status & roadmap
 
-| Scope | Access |
-|---|---|
-| `ingest` | POST to `/api/ingest/batch` |
-| `code` | All `/api/code/*` and `/api/ingest/batch` |
-| `mcp` | Sessions, search, code read |
-| `admin` | All endpoints |
+| Phase | Status | What |
+|---|---|---|
+| 0 | ✅ Done | Cross-platform service hosting, framework-dependent publish profiles, retire legacy UIs |
+| 1 | ✅ Done | Git-aware Tier-0 change detection, per-file delete events, FS-mode deletion sweep |
+| 2 | ✅ Done | Tauri shell scaffold, Rust SCM service control, NSIS installer with .NET prereq detection |
+| 3 | ✅ Done | Admin tables endpoint, ingestor recent events feed, all UI pages |
+| 4 | ✅ Done | runtime.json discovery, MCP discovery, smoke tests, this README |
+| Future | — | macOS/Linux installer parity, GitHub remote indexing, per-symbol embeddings |
+
+---
+
+## License
+
+AGPL-3.0. See [LICENSE](./LICENSE).

@@ -1,21 +1,56 @@
+using System.Text.Json;
 using ModelContextProtocol;
 
-// Auto-discover API port from port file if env var not set
+// Discovery order:
+//   1. Explicit env vars (highest priority — non-desktop deployments override here)
+//   2. runtime.json written by the API service on startup (desktop bundle path)
+//   3. Legacy port file (back-compat with pre-Phase-4 deployments)
 var apiBaseUrl = Environment.GetEnvironmentVariable("AIMEMORY_API_URL") ?? "";
-if (string.IsNullOrWhiteSpace(apiBaseUrl))
+var apiKey = Environment.GetEnvironmentVariable("AIMEMORY_API_KEY") ?? "";
+
+if (string.IsNullOrWhiteSpace(apiBaseUrl) || string.IsNullOrWhiteSpace(apiKey))
 {
-    var portFilePath = Path.Combine(
+    var apiDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "AIMemory", "Api", "port");
-    if (File.Exists(portFilePath)
-        && int.TryParse(File.ReadAllText(portFilePath).Trim(), out var port)
-        && port > 0)
+        "AIMemory", "Api");
+    var runtimeJsonPath = Path.Combine(apiDir, "runtime.json");
+
+    if (File.Exists(runtimeJsonPath))
     {
-        apiBaseUrl = $"http://localhost:{port}";
+        try
+        {
+            using var stream = File.OpenRead(runtimeJsonPath);
+            var doc = JsonDocument.Parse(stream);
+            var root = doc.RootElement;
+
+            if (string.IsNullOrWhiteSpace(apiBaseUrl)
+                && root.TryGetProperty("baseUrl", out var baseUrlElem))
+            {
+                apiBaseUrl = baseUrlElem.GetString() ?? "";
+            }
+            if (string.IsNullOrWhiteSpace(apiKey)
+                && root.TryGetProperty("apiKey", out var apiKeyElem))
+            {
+                apiKey = apiKeyElem.GetString() ?? "";
+            }
+        }
+        catch
+        {
+            // Fall through to port-file fallback if runtime.json is malformed.
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(apiBaseUrl))
+    {
+        var portFilePath = Path.Combine(apiDir, "port");
+        if (File.Exists(portFilePath)
+            && int.TryParse(File.ReadAllText(portFilePath).Trim(), out var port)
+            && port > 0)
+        {
+            apiBaseUrl = $"http://localhost:{port}";
+        }
     }
 }
-
-var apiKey = Environment.GetEnvironmentVariable("AIMEMORY_API_KEY") ?? "";
 
 var builder = Host.CreateEmptyApplicationBuilder(settings: null);
 

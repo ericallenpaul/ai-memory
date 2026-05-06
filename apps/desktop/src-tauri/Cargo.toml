@@ -1,0 +1,27 @@
+[package]
+name = "aimemory-desktop"
+version = "0.1.0"
+description = "AIMemory Desktop control panel for the code-indexer services"
+authors = ["AIMemory contributors"]
+edition = "2021"
+
+[lib]
+name = "aimemory_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Windows Service Control Manager bindings; only used on Windows targets.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"

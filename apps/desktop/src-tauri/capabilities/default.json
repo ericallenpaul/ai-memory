@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the AIMemory Desktop control panel",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "dialog:allow-open",
+    "fs:allow-read-text-file",
+    "fs:allow-app-read"
+  ]
+}

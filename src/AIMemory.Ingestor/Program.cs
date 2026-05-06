@@ -108,8 +108,9 @@ var outboxPath = !string.IsNullOrEmpty(config.Outbox.Path) ? config.Outbox.Path
 builder.Services.AddSingleton(sp =>
     new OutboxStore(outboxPath, config.Outbox.MaxSizeMb, sp.GetRequiredService<ILogger<OutboxStore>>()));
 
-// Windows Service support
-builder.Services.AddWindowsService();
+// Cross-platform service hosting. Both calls are safe no-ops when not running under SCM/systemd.
+builder.Services.AddWindowsService(o => o.ServiceName = "aimemory-ingestor");
+builder.Services.AddSystemd();
 
 // Handle special CLI modes before starting worker
 if (showStatus)

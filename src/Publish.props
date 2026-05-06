@@ -1,0 +1,25 @@
+<Project>
+
+  <!--
+    Shared publish profile for the .NET binaries that ship in the AIMemory desktop bundle.
+    Imported explicitly by AIMemory.Api, AIMemory.Ingestor, and AIMemory.Mcp.
+
+    Framework-dependent: the installer is responsible for ensuring .NET 10 runtime is installed.
+    This keeps each binary in the 5-10MB range instead of the ~200MB of self-contained.
+  -->
+
+  <PropertyGroup>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+
+    <!-- Trim is opt-in per project: the API ships migration assemblies that need root-asm hints,
+         so we leave PublishTrimmed off by default and let the API csproj enable it after testing. -->
+    <PublishTrimmed Condition="'$(PublishTrimmed)' == ''">false</PublishTrimmed>
+
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+
+    <!-- Suppress single-file warnings about analyzers - we don't ship analyzers at runtime. -->
+    <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
+  </PropertyGroup>
+
+</Project>

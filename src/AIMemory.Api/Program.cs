@@ -18,6 +18,11 @@ using AIMemory.CodeIndex.Security;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Cross-platform service hosting. UseWindowsService is a no-op when not running under SCM,
+// UseSystemd is a no-op when not running under systemd, so dev runs unaffected.
+builder.Host.UseWindowsService(o => o.ServiceName = "aimemory-api");
+builder.Host.UseSystemd();
+
 // Load config from ProgramData (written by installer or first-run) with reload support
 var programDataConfigDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),

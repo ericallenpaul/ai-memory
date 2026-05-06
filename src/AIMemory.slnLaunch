@@ -1,0 +1,12 @@
+[
+  {
+    "Name": "AIMemory API + Web UI",
+    "Projects": [
+      {
+        "Path": "AIMemory.Api\\AIMemory.Api.csproj",
+        "Action": "Start",
+        "DebugTarget": "https"
+      }
+    ]
+  }
+]

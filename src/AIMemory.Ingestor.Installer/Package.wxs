@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package
+    Name="AIMemory Ingestor"
+    Manufacturer="AIMemory"
+    Version="0.1.0.0"
+    UpgradeCode="A7E3B2F1-4D5C-4A8E-9F12-3B6C7D8E9A01"
+    Compressed="yes"
+    InstallerVersion="500">
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of AIMemory Ingestor is already installed."
+      AllowSameVersionUpgrades="yes" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Features -->
+    <Feature Id="IngestorFeature" Title="Ingestor Service" Level="1">
+      <ComponentGroupRef Id="IngestorComponents" />
+      <ComponentRef Id="IngestorServiceComponent" />
+      <ComponentRef Id="ProgramDataDirComponent" />
+    </Feature>
+
+    <Feature Id="ConfigAppFeature" Title="Configuration App" Level="1">
+      <ComponentGroupRef Id="ConfigAppComponents" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+    </Feature>
+
+  </Package>
+
+</Wix>

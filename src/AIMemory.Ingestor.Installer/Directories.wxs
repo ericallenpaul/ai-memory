@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Fragment>
+    <!-- Install directories -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="AIMEMORYROOT" Name="AIMemory">
+        <Directory Id="INGESTORDIR" Name="Ingestor" />
+        <Directory Id="CONFIGAPPDIR" Name="ConfigApp" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- ProgramData directory -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="PROGRAMDATAAIMEMORY" Name="AIMemory">
+        <Directory Id="PROGRAMDATAINGESTOR" Name="Ingestor" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start Menu -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="STARTMENUFOLDER" Name="AIMemory" />
+    </StandardDirectory>
+  </Fragment>
+
+  <!-- ProgramData directory creation -->
+  <Fragment>
+    <Component Id="ProgramDataDirComponent" Directory="PROGRAMDATAINGESTOR" Guid="C1D2E3F4-5A6B-7C8D-9E0F-1A2B3C4D5E6F">
+      <CreateFolder>
+        <Permission User="Users" GenericAll="yes" />
+      </CreateFolder>
+    </Component>
+  </Fragment>
+
+</Wix>

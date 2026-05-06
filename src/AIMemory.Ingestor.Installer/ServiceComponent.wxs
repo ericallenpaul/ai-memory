@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Fragment>
+
+    <!-- Ingestor published files (harvested or listed manually) -->
+    <ComponentGroup Id="IngestorComponents" Directory="INGESTORDIR">
+      <Files Include="$(var.IngestorPublishDir)**" />
+    </ComponentGroup>
+
+    <!-- Windows Service registration -->
+    <Component Id="IngestorServiceComponent" Directory="INGESTORDIR" Guid="B2C3D4E5-6F7A-8B9C-0D1E-2F3A4B5C6D7E">
+      <File Id="IngestorExe" Source="$(var.IngestorPublishDir)AIMemory.Ingestor.exe" KeyPath="yes" />
+
+      <ServiceInstall
+        Id="InstallIngestorService"
+        Name="AIMemoryIngestor"
+        DisplayName="AIMemory Ingestor"
+        Description="Ingests AI coding tool transcripts into the AIMemory ledger."
+        Type="ownProcess"
+        Start="auto"
+        ErrorControl="normal"
+        Account="LocalSystem" />
+
+      <ServiceControl
+        Id="ControlIngestorService"
+        Name="AIMemoryIngestor"
+        Start="install"
+        Stop="both"
+        Remove="uninstall"
+        Wait="yes" />
+    </Component>
+
+  </Fragment>
+
+</Wix>

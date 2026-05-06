@@ -1,0 +1,73 @@
+<UserControl x:Class="AIMemory.Ingestor.ConfigApp.Views.SourcesPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:AIMemory.Ingestor.ConfigApp.ViewModels">
+    <StackPanel>
+        <TextBlock Text="Sources" Style="{StaticResource SectionHeader}"/>
+
+        <ItemsControl ItemsSource="{Binding Sources}">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                    <Border BorderBrush="#DDD" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,8">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+
+                            <!-- Row 0: Name + Enabled -->
+                            <StackPanel Orientation="Horizontal" Grid.Row="0" Grid.Column="0">
+                                <CheckBox IsChecked="{Binding Enabled}" VerticalAlignment="Center"/>
+                                <TextBlock Text="Name:" FontSize="13" Margin="8,0,4,0" VerticalAlignment="Center"/>
+                                <TextBox Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}" Width="200" Padding="4" FontSize="13"/>
+                            </StackPanel>
+                            <Button Grid.Row="0" Grid.Column="1" Content="Remove" Padding="8,4"
+                                    Command="{Binding DataContext.RemoveSourceCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                    CommandParameter="{Binding}"/>
+
+                            <!-- Row 1: Adapter Type -->
+                            <StackPanel Orientation="Horizontal" Grid.Row="1" Grid.ColumnSpan="2" Margin="26,6,0,0">
+                                <TextBlock Text="Adapter Type:" FontSize="13" Margin="0,0,4,0" VerticalAlignment="Center"/>
+                                <TextBox Text="{Binding AdapterType, UpdateSourceTrigger=PropertyChanged}" Width="160" Padding="4" FontSize="13"/>
+                            </StackPanel>
+
+                            <!-- Row 2: Watch Paths -->
+                            <StackPanel Grid.Row="2" Grid.ColumnSpan="2" Margin="26,6,0,0">
+                                <TextBlock Text="Watch Paths (one per line):" FontSize="13"/>
+                                <TextBox Text="{Binding WatchPaths, UpdateSourceTrigger=PropertyChanged}"
+                                         AcceptsReturn="True" TextWrapping="Wrap" Height="60" Padding="4" FontSize="13"/>
+                            </StackPanel>
+
+                            <!-- Row 3: File Patterns -->
+                            <StackPanel Orientation="Horizontal" Grid.Row="3" Grid.ColumnSpan="2" Margin="26,6,0,0">
+                                <TextBlock Text="File Patterns:" FontSize="13" Margin="0,0,4,0" VerticalAlignment="Center"/>
+                                <TextBox Text="{Binding FilePatterns, UpdateSourceTrigger=PropertyChanged}" Width="200" Padding="4" FontSize="13"/>
+                            </StackPanel>
+
+                            <!-- Row 4: Segment -->
+                            <StackPanel Orientation="Horizontal" Grid.Row="4" Grid.ColumnSpan="2" Margin="26,6,0,0">
+                                <TextBlock Text="Segment:" FontSize="13" Margin="0,0,4,0" VerticalAlignment="Center"/>
+                                <ComboBox ItemsSource="{x:Static vm:SourceConfigViewModel.SegmentOptions}"
+                                          SelectedItem="{Binding Segment}" Width="120"/>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+
+        <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+            <Button Content="Add Source" Command="{Binding AddSourceCommand}" Padding="12,6" Margin="0,0,8,0"/>
+            <Button Content="Save" Command="{Binding SaveCommand}" Style="{StaticResource PrimaryButton}"/>
+        </StackPanel>
+
+        <TextBlock Text="{Binding StatusMessage}" Foreground="Green" FontSize="13" Margin="0,8,0,0"/>
+    </StackPanel>
+</UserControl>

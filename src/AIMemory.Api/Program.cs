@@ -1,0 +1,1110 @@
+using System.Security.Claims;
+using System.Text.Json;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.EntityFrameworkCore;
+using NLog.Web;
+using AIMemory.Api.Middleware;
+using AIMemory.Data;
+using AIMemory.Data.Repositories;
+using AIMemory.Models.Dtos;
+using AIMemory.Models.Entities;
+using AIMemory.Models.Events;
+using AIMemory.CodeIndex;
+using AIMemory.CodeIndex.Parsers;
+using AIMemory.CodeIndex.Security;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Load config from ProgramData (written by installer or first-run) with reload support
+var programDataConfigDir = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+    "AIMemory", "Api");
+var programDataConfigPath = Path.Combine(programDataConfigDir, "appsettings.json");
+builder.Configuration.AddJsonFile(programDataConfigPath, optional: true, reloadOnChange: true);
+
+// Determine listen port: configured > persisted > random
+// In Development, let launchSettings.json control the port (for SpaProxy + Vite to work)
+var isDevelopment = builder.Environment.IsDevelopment();
+var configuredPort = builder.Configuration.GetValue<int>("AIMemory:Port");
+var portFilePath = Path.Combine(programDataConfigDir, "port");
+
+if (!isDevelopment)
+{
+    if (configuredPort <= 0 && File.Exists(portFilePath)
+        && int.TryParse(File.ReadAllText(portFilePath).Trim(), out var savedPort) && savedPort > 0)
+    {
+        configuredPort = savedPort;
+    }
+
+    if (configuredPort <= 0)
+    {
+        configuredPort = Random.Shared.Next(49152, 65536);
+    }
+
+    builder.WebHost.UseUrls($"http://localhost:{configuredPort}");
+}
+else
+{
+    // In dev, use 5219 as the known port (matches launchSettings + Vite proxy config)
+    configuredPort = 5219;
+}
+
+// Persist the port so the ingestor and config app can discover it
+Directory.CreateDirectory(programDataConfigDir);
+File.WriteAllText(portFilePath, configuredPort.ToString());
+
+// NLog
+builder.Logging.ClearProviders();
+builder.Host.UseNLog();
+
+var startupLogger = NLog.LogManager.GetCurrentClassLogger();
+startupLogger.Info("AIMemory API starting on http://localhost:{Port}", configuredPort);
+startupLogger.Info("Port file written to {PortFile}", portFilePath);
+
+// Database — dynamic provider selection
+// On first run, no provider is configured — default to SQLite so the app can start and serve the setup wizard.
+var dbProvider = builder.Configuration.GetValue<string>("AIMemory:DatabaseProvider");
+var connectionString = Environment.GetEnvironmentVariable("AIMEMORY_CONNECTION_STRING")
+    ?? builder.Configuration.GetConnectionString("AIMemory");
+var isFirstRun = string.IsNullOrEmpty(dbProvider);
+
+if (isFirstRun || string.Equals(dbProvider, "SQLite", StringComparison.OrdinalIgnoreCase))
+{
+    // Ignore any PostgreSQL-style connection string left over from bad config
+    if (string.IsNullOrEmpty(connectionString) || !connectionString.StartsWith("Data Source=", StringComparison.OrdinalIgnoreCase))
+    {
+        var sqliteDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "AIMemory");
+        Directory.CreateDirectory(sqliteDir);
+        connectionString = $"Data Source={Path.Combine(sqliteDir, "aimemory.db")}";
+    }
+    builder.Services.AddDbContext<AIMemoryDbContext>(options => options.UseSqlite(connectionString));
+    builder.Services.AddScoped<ISearchRepository, SqliteSearchRepository>();
+    startupLogger.Info(isFirstRun
+        ? "First run — no database configured, using SQLite: {ConnectionString}"
+        : "Using SQLite provider: {ConnectionString}", connectionString);
+}
+else if (string.Equals(dbProvider, "PostgreSQL", StringComparison.OrdinalIgnoreCase))
+{
+    if (string.IsNullOrEmpty(connectionString))
+    {
+        startupLogger.Error("PostgreSQL selected but no connection string configured. Falling back to SQLite.");
+        var sqliteDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "AIMemory");
+        Directory.CreateDirectory(sqliteDir);
+        connectionString = $"Data Source={Path.Combine(sqliteDir, "aimemory.db")}";
+        builder.Services.AddDbContext<AIMemoryDbContext>(options => options.UseSqlite(connectionString));
+        builder.Services.AddScoped<ISearchRepository, SqliteSearchRepository>();
+        isFirstRun = true;
+    }
+    else
+    {
+        builder.Services.AddDbContext<AIMemoryDbContext>(options => options.UseNpgsql(connectionString));
+        builder.Services.AddScoped<ISearchRepository, SearchRepository>();
+        startupLogger.Info("Using PostgreSQL provider");
+    }
+}
+else
+{
+    startupLogger.Warn("Unknown DatabaseProvider '{Provider}', falling back to SQLite", dbProvider);
+    var sqliteDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "AIMemory");
+    Directory.CreateDirectory(sqliteDir);
+    connectionString = $"Data Source={Path.Combine(sqliteDir, "aimemory.db")}";
+    builder.Services.AddDbContext<AIMemoryDbContext>(options => options.UseSqlite(connectionString));
+    builder.Services.AddScoped<ISearchRepository, SqliteSearchRepository>();
+}
+
+// Repositories
+builder.Services.AddScoped<ISessionRepository, SessionRepository>();
+builder.Services.AddScoped<IMessageRepository, MessageRepository>();
+builder.Services.AddScoped<IToolCallRepository, ToolCallRepository>();
+builder.Services.AddScoped<IArtifactRepository, ArtifactRepository>();
+builder.Services.AddScoped<IIngestionRepository, IngestionRepository>();
+builder.Services.AddScoped<IVectorRepository, VectorRepository>();
+builder.Services.AddScoped<ICodeIndexRepository, CodeIndexRepository>();
+builder.Services.AddScoped<IApiKeyRepository, ApiKeyRepository>();
+
+// Code Index services
+builder.Services.AddSingleton<FileFilter>();
+builder.Services.AddSingleton<ILanguageParser, CSharpParser>();
+builder.Services.AddSingleton<ILanguageParser, PythonParser>();
+builder.Services.AddSingleton<ILanguageParser, TypeScriptParser>();
+builder.Services.AddSingleton<ILanguageParser, GoParser>();
+builder.Services.AddSingleton<ParserRegistry>(sp =>
+    new ParserRegistry(sp.GetServices<ILanguageParser>()));
+builder.Services.AddScoped<CodeIndexingService>();
+builder.Services.AddScoped<CodeQueryService>();
+
+// Cookie authentication for web UI
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(options =>
+    {
+        options.Cookie.Name = "AIMemory.Auth";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Strict;
+        options.ExpireTimeSpan = TimeSpan.FromDays(7);
+        options.SlidingExpiration = true;
+        options.Events.OnRedirectToLogin = context =>
+        {
+            context.Response.StatusCode = 401;
+            return Task.CompletedTask;
+        };
+    });
+builder.Services.AddAuthorization();
+
+// Setup state singleton — tracks whether first-run wizard is needed
+builder.Services.AddSingleton<SetupState>();
+
+// Rate Limiting
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddFixedWindowLimiter("general", opt =>
+    {
+        opt.PermitLimit = 100;
+        opt.Window = TimeSpan.FromMinutes(1);
+    });
+    options.AddSlidingWindowLimiter("search", opt =>
+    {
+        opt.PermitLimit = 30;
+        opt.Window = TimeSpan.FromMinutes(1);
+        opt.SegmentsPerWindow = 6;
+    });
+    options.RejectionStatusCode = 429;
+});
+
+var app = builder.Build();
+
+// Auto-migrate database on startup
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AIMemoryDbContext>();
+    try
+    {
+        db.Database.Migrate();
+        startupLogger.Info("Database migrations applied");
+    }
+    catch (Exception ex)
+    {
+        startupLogger.Warn(ex, "Database migration failed (may need setup wizard): {Message}", ex.Message);
+    }
+
+    // Check if setup is complete
+    var setupState = scope.ServiceProvider.GetRequiredService<SetupState>();
+    try
+    {
+        setupState.IsSetupComplete = db.AdminUsers.Any();
+    }
+    catch
+    {
+        setupState.IsSetupComplete = false;
+    }
+}
+
+// Middleware — request logging before auth so we see all requests including rejected ones
+app.Use(async (context, next) =>
+{
+    var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("AIMemory.Api.Requests");
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    logger.LogInformation("{Method} {Path} from {RemoteIp}",
+        context.Request.Method, context.Request.Path, context.Connection.RemoteIpAddress);
+
+    await next();
+
+    sw.Stop();
+    logger.LogInformation("{Method} {Path} -> {StatusCode} in {ElapsedMs}ms",
+        context.Request.Method, context.Request.Path, context.Response.StatusCode, sw.ElapsedMilliseconds);
+});
+
+app.UseDefaultFiles();
+app.UseStaticFiles();
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseMiddleware<ApiKeyAuthMiddleware>();
+app.UseRateLimiter();
+
+// ==================== Setup Endpoints ====================
+
+app.MapGet("/api/setup/status", (SetupState state) =>
+    Results.Ok(new { needsSetup = !state.IsSetupComplete }));
+
+app.MapPost("/api/setup/init", async (SetupRequest request, AIMemoryDbContext db, SetupState state) =>
+{
+    if (state.IsSetupComplete)
+        return Results.BadRequest(new { error = "Setup already completed" });
+
+    if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password))
+        return Results.BadRequest(new { error = "Username and password are required" });
+
+    if (request.Password.Length < 8)
+        return Results.BadRequest(new { error = "Password must be at least 8 characters" });
+
+    // Write config to ProgramData
+    var config = new Dictionary<string, object>
+    {
+        ["AIMemory"] = new Dictionary<string, object>
+        {
+            ["DatabaseProvider"] = request.DatabaseProvider,
+            ["Port"] = request.Port ?? configuredPort
+        }
+    };
+
+    if (!string.IsNullOrEmpty(request.ConnectionString))
+    {
+        config["ConnectionStrings"] = new Dictionary<string, object>
+        {
+            ["AIMemory"] = request.ConnectionString
+        };
+    }
+
+    Directory.CreateDirectory(programDataConfigDir);
+    var configJson = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+    await File.WriteAllTextAsync(programDataConfigPath, configJson);
+
+    // Create admin user
+    var adminUser = new AdminUser
+    {
+        Username = request.Username,
+        PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password),
+        CreatedAt = DateTimeOffset.UtcNow
+    };
+
+    db.AdminUsers.Add(adminUser);
+    await db.SaveChangesAsync();
+    state.IsSetupComplete = true;
+
+    return Results.Ok(new { message = "Setup complete. Please log in." });
+});
+
+// ==================== Auth Endpoints ====================
+
+app.MapPost("/api/auth/login", async (LoginRequest request, AIMemoryDbContext db, HttpContext httpContext) =>
+{
+    var user = await db.AdminUsers.FirstOrDefaultAsync(u => u.Username == request.Username);
+    if (user is null || !BCrypt.Net.BCrypt.Verify(request.Password, user.PasswordHash))
+        return Results.Json(new { error = "Invalid credentials" }, statusCode: 401);
+
+    var claims = new List<Claim>
+    {
+        new(ClaimTypes.Name, user.Username),
+        new(ClaimTypes.NameIdentifier, user.Id.ToString())
+    };
+    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+    await httpContext.SignInAsync(
+        CookieAuthenticationDefaults.AuthenticationScheme,
+        new ClaimsPrincipal(identity));
+
+    return Results.Ok(new { username = user.Username });
+});
+
+app.MapPost("/api/auth/logout", async (HttpContext httpContext) =>
+{
+    await httpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.Ok(new { message = "Logged out" });
+});
+
+app.MapGet("/api/auth/me", (HttpContext httpContext) =>
+{
+    if (httpContext.User.Identity?.IsAuthenticated != true)
+        return Results.Json(new { error = "Not authenticated" }, statusCode: 401);
+
+    return Results.Ok(new
+    {
+        username = httpContext.User.Identity.Name,
+        id = httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value
+    });
+});
+
+// ==================== Health Endpoint ====================
+
+app.MapGet("/api/health", async (AIMemoryDbContext db) =>
+{
+    try
+    {
+        await db.Database.CanConnectAsync();
+        return Results.Ok(new { status = "healthy", database = "connected" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { status = "degraded", database = "disconnected", error = ex.Message });
+    }
+}).RequireRateLimiting("general");
+
+// ==================== Stats Endpoint ====================
+
+app.MapGet("/api/stats", async (AIMemoryDbContext db) =>
+{
+    var today = DateTimeOffset.UtcNow.Date;
+    var thirtyDaysAgo = today.AddDays(-30);
+
+    var totalSessions = await db.Sessions.CountAsync();
+    var totalMessages = await db.Messages.CountAsync();
+    var tokenStats = await db.Messages
+        .GroupBy(_ => 1)
+        .Select(g => new
+        {
+            TotalTokensIn = g.Sum(m => (long)(m.TokenIn ?? 0)),
+            TotalTokensOut = g.Sum(m => (long)(m.TokenOut ?? 0)),
+            TotalCostUsd = g.Sum(m => m.CostUsd ?? 0m)
+        })
+        .FirstOrDefaultAsync();
+
+    var sessionsToday = await db.Sessions
+        .CountAsync(s => s.CreatedAt >= new DateTimeOffset(today, TimeSpan.Zero));
+
+    var dailySessionStats = (await db.Sessions
+        .Where(s => s.CreatedAt >= new DateTimeOffset(thirtyDaysAgo, TimeSpan.Zero))
+        .Select(s => s.CreatedAt)
+        .ToListAsync())
+        .GroupBy(d => d.Date)
+        .Select(g => new { Date = g.Key, Count = g.Count() })
+        .ToList();
+
+    var dailyMessageStats = (await db.Messages
+        .Where(m => m.CreatedAt >= new DateTimeOffset(thirtyDaysAgo, TimeSpan.Zero))
+        .Select(m => m.CreatedAt)
+        .ToListAsync())
+        .GroupBy(d => d.Date)
+        .Select(g => new { Date = g.Key, Count = g.Count() })
+        .ToList();
+
+    var dailyStats = Enumerable.Range(0, 30)
+        .Select(i => thirtyDaysAgo.AddDays(i))
+        .Select(date => new DailyStats
+        {
+            Date = date.ToString("yyyy-MM-dd"),
+            Sessions = dailySessionStats.FirstOrDefault(d => d.Date == date)?.Count ?? 0,
+            Messages = dailyMessageStats.FirstOrDefault(d => d.Date == date)?.Count ?? 0
+        })
+        .ToList();
+
+    return Results.Ok(new StatsResponse
+    {
+        TotalSessions = totalSessions,
+        TotalMessages = totalMessages,
+        TotalTokensIn = tokenStats?.TotalTokensIn ?? 0,
+        TotalTokensOut = tokenStats?.TotalTokensOut ?? 0,
+        TotalCostUsd = tokenStats?.TotalCostUsd ?? 0m,
+        SessionsToday = sessionsToday,
+        DailyStats = dailyStats
+    });
+}).RequireRateLimiting("general");
+
+// ==================== Session Endpoints ====================
+
+app.MapPost("/api/sessions", async (CreateSessionRequest request, ISessionRepository repo) =>
+{
+    var session = new Session
+    {
+        Title = request.Title,
+        Project = request.Project,
+        Repo = request.Repo,
+        Branch = request.Branch,
+        Tags = request.Tags ?? [],
+        Source = request.Source,
+        ExternalId = request.ExternalId
+    };
+
+    var created = await repo.CreateAsync(session);
+    return Results.Created($"/api/sessions/{created.SessionId}", new { sessionId = created.SessionId });
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/sessions", async (string? project, string? repo, string? source, string? tag,
+    DateTimeOffset? from, DateTimeOffset? to, int? limit, int? offset,
+    ISessionRepository sessionRepo, IMessageRepository messageRepo) =>
+{
+    var sessions = await sessionRepo.ListAsync(project, repo, source, tag, from, to, limit ?? 50, offset ?? 0);
+
+    var response = new List<SessionResponse>();
+    foreach (var session in sessions)
+    {
+        var messages = await messageRepo.GetBySessionAsync(session.SessionId, 1);
+        response.Add(new SessionResponse
+        {
+            SessionId = session.SessionId,
+            ExternalId = session.ExternalId,
+            Title = session.Title,
+            Project = session.Project,
+            Repo = session.Repo,
+            Branch = session.Branch,
+            Tags = session.Tags,
+            Source = session.Source,
+            IsArchived = session.IsArchived,
+            CreatedAt = session.CreatedAt,
+            UpdatedAt = session.UpdatedAt,
+            MessageCount = messages.Count > 0 ? await GetMessageCount(messageRepo, session.SessionId) : 0
+        });
+    }
+    return Results.Ok(response);
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/sessions/{sessionId:guid}", async (Guid sessionId, int? limit,
+    bool? includeToolCalls, bool? includeArtifacts,
+    ISessionRepository sessionRepo, IMessageRepository messageRepo,
+    IToolCallRepository toolCallRepo, IArtifactRepository artifactRepo) =>
+{
+    var session = await sessionRepo.GetByIdAsync(sessionId);
+    if (session is null) return Results.NotFound(new { error = "Session not found" });
+
+    var messages = await messageRepo.GetBySessionAsync(sessionId, limit ?? 100);
+
+    var response = new SessionResponse
+    {
+        SessionId = session.SessionId,
+        ExternalId = session.ExternalId,
+        Title = session.Title,
+        Project = session.Project,
+        Repo = session.Repo,
+        Branch = session.Branch,
+        Tags = session.Tags,
+        Source = session.Source,
+        IsArchived = session.IsArchived,
+        CreatedAt = session.CreatedAt,
+        UpdatedAt = session.UpdatedAt,
+        MessageCount = messages.Count,
+        Messages = messages.Select(m => new MessageResponse
+        {
+            MessageId = m.MessageId,
+            SessionId = m.SessionId,
+            Role = m.Role,
+            Content = m.Content,
+            Provider = m.Provider,
+            Model = m.Model,
+            TokenIn = m.TokenIn,
+            TokenOut = m.TokenOut,
+            CostUsd = m.CostUsd,
+            LatencyMs = m.LatencyMs,
+            CreatedAt = m.CreatedAt
+        }).ToList()
+    };
+
+    if (includeToolCalls != false)
+    {
+        var toolCalls = await toolCallRepo.GetBySessionAsync(sessionId);
+        response.ToolCalls = toolCalls.Select(tc => new ToolCallResponse
+        {
+            ToolCallId = tc.ToolCallId,
+            SessionId = tc.SessionId,
+            ToolName = tc.ToolName,
+            ArgumentsJson = tc.ArgumentsJson,
+            ResultJson = tc.ResultJson,
+            CreatedAt = tc.CreatedAt
+        }).ToList();
+    }
+
+    if (includeArtifacts != false)
+    {
+        var artifacts = await artifactRepo.GetBySessionAsync(sessionId);
+        response.Artifacts = artifacts.Select(a => new ArtifactResponse
+        {
+            ArtifactId = a.ArtifactId,
+            SessionId = a.SessionId,
+            Type = a.Type,
+            PathOrUrl = a.PathOrUrl,
+            Hash = a.Hash,
+            MetadataJson = a.MetadataJson,
+            CreatedAt = a.CreatedAt
+        }).ToList();
+    }
+
+    return Results.Ok(response);
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/sessions/{sessionId:guid}/messages", async (Guid sessionId, AppendMessageRequest request,
+    ISessionRepository sessionRepo, IMessageRepository messageRepo) =>
+{
+    var session = await sessionRepo.GetByIdAsync(sessionId);
+    if (session is null) return Results.NotFound(new { error = "Session not found" });
+
+    var message = new Message
+    {
+        SessionId = sessionId,
+        Role = request.Role,
+        Content = request.Content,
+        Provider = request.Provider,
+        Model = request.Model,
+        RequestId = request.RequestId,
+        TokenIn = request.TokenIn,
+        TokenOut = request.TokenOut,
+        CostUsd = request.CostUsd,
+        LatencyMs = request.LatencyMs,
+        ExternalId = request.ExternalId
+    };
+
+    var created = await messageRepo.AppendAsync(message);
+    return Results.Created($"/api/sessions/{sessionId}/messages/{created.MessageId}",
+        new { messageId = created.MessageId });
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/sessions/{sessionId:guid}/toolcalls", async (Guid sessionId, AppendToolCallRequest request,
+    ISessionRepository sessionRepo, IToolCallRepository toolCallRepo) =>
+{
+    var session = await sessionRepo.GetByIdAsync(sessionId);
+    if (session is null) return Results.NotFound(new { error = "Session not found" });
+
+    var toolCall = new ToolCall
+    {
+        SessionId = sessionId,
+        ToolName = request.ToolName,
+        ArgumentsJson = request.ArgumentsJson.HasValue
+            ? JsonDocument.Parse(request.ArgumentsJson.Value.GetRawText())
+            : null,
+        ResultJson = request.ResultJson.HasValue
+            ? JsonDocument.Parse(request.ResultJson.Value.GetRawText())
+            : null,
+        ExternalId = request.ExternalId
+    };
+
+    var created = await toolCallRepo.AppendAsync(toolCall);
+    return Results.Created($"/api/sessions/{sessionId}/toolcalls/{created.ToolCallId}",
+        new { toolCallId = created.ToolCallId });
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/sessions/{sessionId:guid}/artifacts", async (Guid sessionId, AppendArtifactRequest request,
+    ISessionRepository sessionRepo, IArtifactRepository artifactRepo) =>
+{
+    var session = await sessionRepo.GetByIdAsync(sessionId);
+    if (session is null) return Results.NotFound(new { error = "Session not found" });
+
+    var artifact = new Artifact
+    {
+        SessionId = sessionId,
+        Type = request.Type,
+        PathOrUrl = request.PathOrUrl,
+        Hash = request.Hash,
+        MetadataJson = request.MetadataJson.HasValue
+            ? JsonDocument.Parse(request.MetadataJson.Value.GetRawText())
+            : null,
+        ExternalId = request.ExternalId
+    };
+
+    var created = await artifactRepo.AppendAsync(artifact);
+    return Results.Created($"/api/sessions/{sessionId}/artifacts/{created.ArtifactId}",
+        new { artifactId = created.ArtifactId });
+}).RequireRateLimiting("general");
+
+// ==================== Search Endpoint ====================
+
+app.MapGet("/api/search", async (string q, string? project, string? repo, string? source, int? limit, int? offset,
+    ISearchRepository searchRepo) =>
+{
+    if (string.IsNullOrWhiteSpace(q))
+        return Results.BadRequest(new { error = "Query parameter 'q' is required" });
+
+    var results = await searchRepo.SearchAsync(q, project, repo, source, limit ?? 10, offset ?? 0);
+    return Results.Ok(results);
+}).RequireRateLimiting("search");
+
+// ==================== Ingestion Endpoints ====================
+
+app.MapGet("/api/ingestion-log", async (string? source, string? eventType, int? limit, int? offset,
+    IIngestionRepository ingestionRepo) =>
+{
+    var entries = await ingestionRepo.ListAsync(source, eventType, limit ?? 50, offset ?? 0);
+    return Results.Ok(entries);
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbContext db,
+    ISessionRepository sessionRepo, IMessageRepository messageRepo,
+    IToolCallRepository toolCallRepo, IArtifactRepository artifactRepo,
+    IIngestionRepository ingestionRepo, ICodeIndexRepository codeIndexRepo,
+    ILoggerFactory loggerFactory) =>
+{
+    var batchLogger = loggerFactory.CreateLogger("AIMemory.Api.Ingest");
+    batchLogger.LogInformation("Batch received: {Count} events from client={ClientId} source={Source}",
+        request.Events.Count, request.ClientId, request.Source);
+
+    var eventResults = new List<IngestEventResult>();
+    var existingKeys = await ingestionRepo.FilterExistingKeysAsync(request.Events.Select(e => e.IdempotencyKey));
+
+    foreach (var evt in request.Events)
+    {
+        if (existingKeys.Contains(evt.IdempotencyKey))
+        {
+            eventResults.Add(new IngestEventResult
+            {
+                IdempotencyKey = evt.IdempotencyKey,
+                Status = "duplicate"
+            });
+            continue;
+        }
+
+        try
+        {
+            switch (evt.Type)
+            {
+                case "SessionUpsert":
+                    var sessionEvt = JsonSerializer.Deserialize<SessionUpsertEvent>(
+                        evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (sessionEvt != null)
+                    {
+                        await sessionRepo.UpsertByExternalIdAsync(new Session
+                        {
+                            ExternalId = sessionEvt.SessionExternalId,
+                            Title = sessionEvt.Title ?? "Untitled",
+                            Project = sessionEvt.Project,
+                            Repo = sessionEvt.Repo,
+                            Branch = sessionEvt.Branch,
+                            Tags = sessionEvt.Tags ?? [],
+                            Source = sessionEvt.Source,
+                            MachineName = request.MachineName
+                        });
+                    }
+                    break;
+
+                case "MessageAppend":
+                    var msgEvt = JsonSerializer.Deserialize<MessageAppendEvent>(
+                        evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (msgEvt != null)
+                    {
+                        var session = await sessionRepo.GetByExternalIdAsync(msgEvt.SessionExternalId);
+                        if (session != null)
+                        {
+                            await messageRepo.AppendAsync(new Message
+                            {
+                                SessionId = session.SessionId,
+                                ExternalId = msgEvt.MessageExternalId,
+                                Role = msgEvt.Role,
+                                Content = msgEvt.Content,
+                                Provider = msgEvt.Provider,
+                                Model = msgEvt.Model,
+                                TokenIn = msgEvt.TokenIn,
+                                TokenOut = msgEvt.TokenOut,
+                                CostUsd = msgEvt.CostUsd,
+                                LatencyMs = msgEvt.LatencyMs,
+                                CreatedAt = msgEvt.CreatedAt
+                            });
+                        }
+                    }
+                    break;
+
+                case "ToolCallAppend":
+                    var tcEvt = JsonSerializer.Deserialize<ToolCallAppendEvent>(
+                        evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (tcEvt != null)
+                    {
+                        var tcSession = await sessionRepo.GetByExternalIdAsync(tcEvt.SessionExternalId);
+                        if (tcSession != null)
+                        {
+                            await toolCallRepo.AppendAsync(new ToolCall
+                            {
+                                SessionId = tcSession.SessionId,
+                                ExternalId = tcEvt.ToolCallExternalId,
+                                ToolName = tcEvt.ToolName,
+                                ArgumentsJson = tcEvt.ArgumentsJson.HasValue
+                                    ? JsonDocument.Parse(tcEvt.ArgumentsJson.Value.GetRawText()) : null,
+                                ResultJson = tcEvt.ResultJson.HasValue
+                                    ? JsonDocument.Parse(tcEvt.ResultJson.Value.GetRawText()) : null,
+                                CreatedAt = tcEvt.CreatedAt
+                            });
+                        }
+                    }
+                    break;
+
+                case "ArtifactAppend":
+                    var artEvt = JsonSerializer.Deserialize<ArtifactAppendEvent>(
+                        evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (artEvt != null)
+                    {
+                        var artSession = await sessionRepo.GetByExternalIdAsync(artEvt.SessionExternalId);
+                        if (artSession != null)
+                        {
+                            await artifactRepo.AppendAsync(new Artifact
+                            {
+                                SessionId = artSession.SessionId,
+                                ExternalId = artEvt.ArtifactExternalId,
+                                Type = artEvt.Type,
+                                PathOrUrl = artEvt.PathOrUrl,
+                                Hash = artEvt.Hash,
+                                MetadataJson = artEvt.MetadataJson.HasValue
+                                    ? JsonDocument.Parse(artEvt.MetadataJson.Value.GetRawText()) : null,
+                                CreatedAt = artEvt.CreatedAt
+                            });
+                        }
+                    }
+                    break;
+
+                case "CodeFileUpsert":
+                    var codeFileEvt = JsonSerializer.Deserialize<CodeFileUpsertEvent>(
+                        evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (codeFileEvt != null)
+                    {
+                        var repo = await codeIndexRepo.GetRepositoryByNameAsync(codeFileEvt.RepositoryName);
+                        if (repo == null)
+                        {
+                            repo = await codeIndexRepo.UpsertRepositoryAsync(new CodeRepository
+                            {
+                                Name = codeFileEvt.RepositoryName,
+                                SourceType = codeFileEvt.SourceType,
+                                SourcePath = codeFileEvt.SourcePath,
+                                IndexedAt = DateTimeOffset.UtcNow,
+                                UpdatedAt = DateTimeOffset.UtcNow
+                            });
+                        }
+
+                        await codeIndexRepo.UpsertFileAsync(new CodeFile
+                        {
+                            RepositoryId = repo.RepositoryId,
+                            FilePath = codeFileEvt.FilePath,
+                            Language = codeFileEvt.Language,
+                            FileSize = codeFileEvt.FileSize,
+                            ContentHash = codeFileEvt.ContentHash,
+                            IndexedAt = DateTimeOffset.UtcNow
+                        });
+
+                        await codeIndexRepo.UpdateRepositoryStatsAsync(repo.RepositoryId);
+                    }
+                    break;
+
+                case "CodeSymbolBatch":
+                    var symBatchEvt = JsonSerializer.Deserialize<CodeSymbolBatchEvent>(
+                        evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (symBatchEvt != null)
+                    {
+                        var symRepo = await codeIndexRepo.GetRepositoryByNameAsync(symBatchEvt.RepositoryName);
+                        if (symRepo != null)
+                        {
+                            var files = await codeIndexRepo.GetFileTreeAsync(symRepo.RepositoryId);
+                            var file = files.FirstOrDefault(f => f.FilePath == symBatchEvt.FilePath);
+                            if (file != null)
+                            {
+                                var symbols = symBatchEvt.Symbols.Select(s => new CodeSymbol
+                                {
+                                    FileId = file.FileId,
+                                    RepositoryId = symRepo.RepositoryId,
+                                    SymbolKey = s.SymbolKey,
+                                    Name = s.Name,
+                                    QualifiedName = s.QualifiedName,
+                                    Kind = s.Kind,
+                                    Signature = s.Signature,
+                                    StartLine = s.StartLine,
+                                    EndLine = s.EndLine,
+                                    StartByte = s.StartByte,
+                                    EndByte = s.EndByte,
+                                    ParentSymbolKey = s.ParentSymbolKey,
+                                    IndexedAt = DateTimeOffset.UtcNow
+                                }).ToList();
+
+                                await codeIndexRepo.UpsertSymbolsAsync(file.FileId, symRepo.RepositoryId, symbols);
+                                await codeIndexRepo.UpdateRepositoryStatsAsync(symRepo.RepositoryId);
+                            }
+                        }
+                    }
+                    break;
+
+                default:
+                    eventResults.Add(new IngestEventResult
+                    {
+                        IdempotencyKey = evt.IdempotencyKey,
+                        Status = "error",
+                        Error = $"Unknown event type: {evt.Type}"
+                    });
+                    continue;
+            }
+
+            await ingestionRepo.LogAsync(new IngestionLogEntry
+            {
+                IdempotencyKey = evt.IdempotencyKey,
+                EventType = evt.Type,
+                Source = request.Source,
+                SourcePath = evt.IdempotencyKey.Split('|').ElementAtOrDefault(1) ?? "",
+                RecordOffset = long.TryParse(evt.IdempotencyKey.Split('|').ElementAtOrDefault(2), out var off) ? off : 0,
+                MachineName = request.MachineName
+            });
+
+            eventResults.Add(new IngestEventResult
+            {
+                IdempotencyKey = evt.IdempotencyKey,
+                Status = "ok"
+            });
+        }
+        catch (Exception ex)
+        {
+            batchLogger.LogError(ex, "Event {Type} failed: key={Key}", evt.Type, evt.IdempotencyKey);
+            eventResults.Add(new IngestEventResult
+            {
+                IdempotencyKey = evt.IdempotencyKey,
+                Status = "error",
+                Error = ex.Message
+            });
+        }
+    }
+
+    var succeeded = eventResults.Count(r => r.Status == "ok");
+    var duplicates = eventResults.Count(r => r.Status == "duplicate");
+    var failed = eventResults.Count(r => r.Status == "error");
+    batchLogger.LogInformation("Batch complete: {Succeeded} ok, {Duplicates} duplicates, {Failed} failed",
+        succeeded, duplicates, failed);
+
+    return Results.Ok(new BatchIngestResponse
+    {
+        Total = eventResults.Count,
+        Succeeded = succeeded,
+        Duplicates = duplicates,
+        Failed = failed,
+        Results = eventResults
+    });
+}).RequireRateLimiting("general");
+
+// ==================== Code Index Endpoints ====================
+
+app.MapPost("/api/code/index-folder", async (IndexFolderRequest request, CodeIndexingService indexer) =>
+{
+    if (string.IsNullOrWhiteSpace(request.FolderPath))
+        return Results.BadRequest(new { error = "FolderPath is required" });
+
+    var repo = await indexer.IndexLocalFolderAsync(request.FolderPath, request.Name);
+    return Results.Ok(new CodeRepoResponse
+    {
+        RepositoryId = repo.RepositoryId,
+        Name = repo.Name,
+        SourceType = repo.SourceType,
+        SourcePath = repo.SourcePath,
+        FileCount = repo.FileCount,
+        SymbolCount = repo.SymbolCount,
+        IndexedAt = repo.IndexedAt,
+        UpdatedAt = repo.UpdatedAt
+    });
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/code/repos", async (CodeQueryService query) =>
+{
+    var repos = await query.ListRepositoriesAsync();
+    return Results.Ok(repos);
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/code/repos/{repoId:guid}", async (Guid repoId, ICodeIndexRepository codeRepo) =>
+{
+    var repo = await codeRepo.GetRepositoryAsync(repoId);
+    if (repo == null) return Results.NotFound(new { error = "Repository not found" });
+
+    return Results.Ok(new CodeRepoResponse
+    {
+        RepositoryId = repo.RepositoryId,
+        Name = repo.Name,
+        SourceType = repo.SourceType,
+        SourcePath = repo.SourcePath,
+        FileCount = repo.FileCount,
+        SymbolCount = repo.SymbolCount,
+        IndexedAt = repo.IndexedAt,
+        UpdatedAt = repo.UpdatedAt
+    });
+}).RequireRateLimiting("general");
+
+app.MapDelete("/api/code/repos/{repoId:guid}", async (Guid repoId, ICodeIndexRepository codeRepo) =>
+{
+    await codeRepo.DeleteRepositoryAsync(repoId);
+    return Results.Ok(new { message = "Repository deleted" });
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/code/repos/{repoId:guid}/reindex", async (Guid repoId, CodeIndexingService indexer) =>
+{
+    var repo = await indexer.ReindexAsync(repoId);
+    return Results.Ok(new CodeRepoResponse
+    {
+        RepositoryId = repo.RepositoryId,
+        Name = repo.Name,
+        SourceType = repo.SourceType,
+        SourcePath = repo.SourcePath,
+        FileCount = repo.FileCount,
+        SymbolCount = repo.SymbolCount,
+        IndexedAt = repo.IndexedAt,
+        UpdatedAt = repo.UpdatedAt
+    });
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/code/repos/{repoId:guid}/tree", async (Guid repoId, CodeQueryService query) =>
+{
+    var tree = await query.GetFileTreeAsync(repoId);
+    if (tree == null) return Results.NotFound(new { error = "Repository not found" });
+    return Results.Ok(tree);
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/code/repos/{repoId:guid}/outline", async (Guid repoId, string? file, CodeQueryService query) =>
+{
+    if (!string.IsNullOrEmpty(file))
+    {
+        var outline = await query.GetFileOutlineAsync(repoId, file);
+        if (outline == null) return Results.NotFound(new { error = "Repository not found" });
+        return Results.Ok(outline);
+    }
+
+    var repoOutline = await query.GetRepoOutlineAsync(repoId);
+    if (repoOutline == null) return Results.NotFound(new { error = "Repository not found" });
+    return Results.Ok(repoOutline);
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/code/repos/{repoId:guid}/symbol", async (Guid repoId, string key, CodeQueryService query) =>
+{
+    if (string.IsNullOrWhiteSpace(key))
+        return Results.BadRequest(new { error = "Symbol key is required" });
+
+    var symbol = await query.GetSymbolAsync(repoId, key);
+    if (symbol == null) return Results.NotFound(new { error = "Symbol not found" });
+    return Results.Ok(symbol);
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/code/repos/{repoId:guid}/symbols", async (Guid repoId, List<string> symbolKeys, CodeQueryService query) =>
+{
+    var symbols = await query.GetSymbolsAsync(repoId, symbolKeys);
+    return Results.Ok(symbols);
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/code/search/symbols", async (string q, Guid? repo, string? kind, int? limit, CodeQueryService query) =>
+{
+    if (string.IsNullOrWhiteSpace(q))
+        return Results.BadRequest(new { error = "Query parameter 'q' is required" });
+
+    var results = await query.SearchSymbolsAsync(q, repo, kind, limit ?? 20);
+    return Results.Ok(results);
+}).RequireRateLimiting("search");
+
+app.MapGet("/api/code/search/text", async (string q, Guid? repo, string? file, int? limit, CodeQueryService query) =>
+{
+    if (string.IsNullOrWhiteSpace(q))
+        return Results.BadRequest(new { error = "Query parameter 'q' is required" });
+
+    var results = await query.SearchTextAsync(q, repo, file, limit ?? 20);
+    return Results.Ok(results);
+}).RequireRateLimiting("search");
+
+// ==================== API Key Management Endpoints ====================
+
+app.MapGet("/api/keys", async (IApiKeyRepository keyRepo) =>
+{
+    var keys = await keyRepo.ListAsync();
+    return Results.Ok(keys.Select(k => new ApiKeyResponse
+    {
+        ApiKeyId = k.ApiKeyId,
+        Name = k.Name,
+        KeyPrefix = k.KeyPrefix,
+        Scopes = k.Scopes,
+        IsActive = k.IsActive,
+        CreatedAt = k.CreatedAt,
+        LastUsedAt = k.LastUsedAt,
+        ExpiresAt = k.ExpiresAt,
+        CreatedBy = k.CreatedBy
+    }));
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/keys", async (CreateApiKeyRequest request, IApiKeyRepository keyRepo, HttpContext httpContext) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Name))
+        return Results.BadRequest(new { error = "Name is required" });
+
+    if (request.Scopes.Count == 0)
+        return Results.BadRequest(new { error = "At least one scope is required" });
+
+    var validScopes = new HashSet<string> { "ingest", "code", "mcp", "admin" };
+    if (request.Scopes.Any(s => !validScopes.Contains(s)))
+        return Results.BadRequest(new { error = "Invalid scope. Valid: ingest, code, mcp, admin" });
+
+    // Generate raw key
+    var rawKey = "aimemory_" + Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+    var keyHash = Convert.ToHexStringLower(
+        System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(rawKey)));
+    var keyPrefix = rawKey[8..16]; // first 8 hex chars after prefix
+
+    var apiKey = await keyRepo.CreateAsync(new ApiKey
+    {
+        Name = request.Name,
+        KeyHash = keyHash,
+        KeyPrefix = keyPrefix,
+        Scopes = request.Scopes,
+        ExpiresAt = request.ExpiresAt,
+        CreatedBy = httpContext.User.Identity?.Name
+    });
+
+    return Results.Created($"/api/keys/{apiKey.ApiKeyId}", new CreateApiKeyResponse
+    {
+        ApiKeyId = apiKey.ApiKeyId,
+        Name = apiKey.Name,
+        RawKey = rawKey,
+        KeyPrefix = keyPrefix,
+        Scopes = apiKey.Scopes
+    });
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/keys/{id:guid}", async (Guid id, IApiKeyRepository keyRepo) =>
+{
+    var key = await keyRepo.GetByIdAsync(id);
+    if (key == null) return Results.NotFound(new { error = "API key not found" });
+
+    return Results.Ok(new ApiKeyResponse
+    {
+        ApiKeyId = key.ApiKeyId,
+        Name = key.Name,
+        KeyPrefix = key.KeyPrefix,
+        Scopes = key.Scopes,
+        IsActive = key.IsActive,
+        CreatedAt = key.CreatedAt,
+        LastUsedAt = key.LastUsedAt,
+        ExpiresAt = key.ExpiresAt,
+        CreatedBy = key.CreatedBy
+    });
+}).RequireRateLimiting("general");
+
+app.MapPatch("/api/keys/{id:guid}", async (Guid id, UpdateApiKeyRequest request, IApiKeyRepository keyRepo) =>
+{
+    var key = await keyRepo.UpdateAsync(id, k =>
+    {
+        if (request.Name != null) k.Name = request.Name;
+        if (request.Scopes != null) k.Scopes = request.Scopes;
+        if (request.IsActive.HasValue) k.IsActive = request.IsActive.Value;
+    });
+
+    if (key == null) return Results.NotFound(new { error = "API key not found" });
+
+    return Results.Ok(new ApiKeyResponse
+    {
+        ApiKeyId = key.ApiKeyId,
+        Name = key.Name,
+        KeyPrefix = key.KeyPrefix,
+        Scopes = key.Scopes,
+        IsActive = key.IsActive,
+        CreatedAt = key.CreatedAt,
+        LastUsedAt = key.LastUsedAt,
+        ExpiresAt = key.ExpiresAt,
+        CreatedBy = key.CreatedBy
+    });
+}).RequireRateLimiting("general");
+
+app.MapDelete("/api/keys/{id:guid}", async (Guid id, IApiKeyRepository keyRepo) =>
+{
+    await keyRepo.DeleteAsync(id);
+    return Results.Ok(new { message = "API key deleted" });
+}).RequireRateLimiting("general");
+
+// ==================== SPA ====================
+// Development: SpaProxy hosting startup (via launchSettings.json) auto-launches Vite
+// and redirects the browser to http://localhost:5173. Vite serves the React app and
+// proxies /api/* back here. No reverse proxy needed from .NET to Vite.
+//
+// Production: serve the pre-built React app from wwwroot.
+if (!app.Environment.IsDevelopment())
+{
+    app.MapFallbackToFile("index.html");
+}
+
+app.Run();
+
+// ==================== Helper Methods ====================
+
+static async Task<int> GetMessageCount(IMessageRepository repo, Guid sessionId)
+{
+    var messages = await repo.GetBySessionAsync(sessionId, 10000);
+    return messages.Count;
+}
+
+// ==================== Setup State ====================
+
+public class SetupState
+{
+    public bool IsSetupComplete { get; set; }
+}

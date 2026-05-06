@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Fragment>
+
+    <!-- Config App published files -->
+    <ComponentGroup Id="ConfigAppComponents" Directory="CONFIGAPPDIR">
+      <Files Include="$(var.ConfigAppPublishDir)**" />
+    </ComponentGroup>
+
+    <!-- Start Menu shortcut -->
+    <Component Id="StartMenuShortcutComponent" Directory="STARTMENUFOLDER" Guid="D3E4F5A6-7B8C-9D0E-1F2A-3B4C5D6E7F8A">
+      <Shortcut
+        Id="ConfigAppShortcut"
+        Name="AIMemory Ingestor Config"
+        Description="Configure the AIMemory Ingestor service"
+        Target="[CONFIGAPPDIR]AIMemory.Ingestor.ConfigApp.exe"
+        WorkingDirectory="CONFIGAPPDIR" />
+
+      <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
+      <RegistryValue
+        Root="HKCU"
+        Key="Software\AIMemory\Ingestor"
+        Name="StartMenuShortcut"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+    </Component>
+
+  </Fragment>
+
+</Wix>

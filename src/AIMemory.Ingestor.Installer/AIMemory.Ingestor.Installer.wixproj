@@ -1,0 +1,12 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IngestorPublishDir>$(MSBuildProjectDirectory)\..\..\publish\Ingestor\</IngestorPublishDir>
+    <ConfigAppPublishDir>$(MSBuildProjectDirectory)\..\..\publish\ConfigApp\</ConfigAppPublishDir>
+  </PropertyGroup>
+
+</Project>

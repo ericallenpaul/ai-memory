@@ -1,0 +1,6 @@
+@AIMemory.Mcp_HostAddress = http://localhost:5230
+
+GET {{AIMemory.Mcp_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

@@ -1,0 +1,73 @@
+{
+  "agents": {
+    "description": "3-agent consolidated architecture for improved performance",
+    "primary": ["research-innovate", "plan-execute", "review"]
+  },
+  "commands": {
+    "description": "RIPER mode control and memory bank operations",
+    "namespaces": ["riper", "memory"]
+  },
+  "memory-bank": {
+    "auto-backup": true,
+    "branch-aware": true,
+    "directories": {
+      "backups": "backups",
+      "plans": "{branch}/plans",
+      "reviews": "{branch}/reviews",
+      "root": ".claude/memory-bank",
+      "sessions": "{branch}/sessions"
+    },
+    "enabled": true
+  },
+  "project-context": {
+    "important-paths": {
+      "comment": "OpenBrain project structure",
+      "specs": ".",
+      "main": "src",
+      "api": "src/OpenBrain.Api",
+      "data": "src/OpenBrain.Data",
+      "models": "src/OpenBrain.Models",
+      "ingestor": "src/OpenBrain.Ingestor",
+      "mcp": "src/OpenBrain.Mcp",
+      "tests": "tests",
+      "scripts": "scripts",
+      "logs": "logs",
+      "docker": "docker"
+    },
+    "key-patterns": [
+      "ILogger",
+      "IService",
+      "IRepository",
+      "NLog",
+      "Polly",
+      "HttpClient",
+      "PostgreSQL",
+      "DependencyInjection",
+      "ISourceAdapter",
+      "DbContext",
+      "EF Core",
+      "tsvector",
+      "MCP"
+    ],
+    "tech-stack": [
+      ".NET 10",
+      "C#",
+      "NLog",
+      "Polly",
+      "PostgreSQL 18",
+      "EF Core (Npgsql)",
+      "pg_trgm",
+      "Full-Text Search",
+      "Docker",
+      "MCP (Model Context Protocol)"
+    ]
+  },
+  "reference-docs": [
+    "spec.md",
+    "ingester-spec.md",
+    ".claude/project-info.md",
+    ".claude/memory-bank/main/plans/main-2026-03-02-openbrain-implementation.md"
+  ],
+  "version": "1.0.0",
+  "workflow": "RIPER"
+}

@@ -1,0 +1,11 @@
+<Solution>
+  <Project Path="../tests/AIMemory.Tests.Integration/AIMemory.Tests.Integration.csproj" />
+  <Project Path="../tests/AIMemory.Tests.Unit/AIMemory.Tests.Unit.csproj" />
+  <Project Path="AIMemory.Api/AIMemory.Api.csproj" />
+  <Project Path="AIMemory.Data/AIMemory.Data.csproj" />
+  <Project Path="AIMemory.Ingestor/AIMemory.Ingestor.csproj" />
+  <Project Path="AIMemory.Ingestor.ConfigApp/AIMemory.Ingestor.ConfigApp.csproj" />
+  <Project Path="AIMemory.CodeIndex/AIMemory.CodeIndex.csproj" />
+  <Project Path="AIMemory.Mcp/AIMemory.Mcp.csproj" />
+  <Project Path="AIMemory.Models/AIMemory.Models.csproj" />
+</Solution>

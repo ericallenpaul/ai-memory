@@ -1,0 +1,8 @@
+{
+  "hooks": {},
+  "instructions": "This project uses the RIPER workflow with 3 consolidated agents (research-innovate, plan-execute, review). See .claude/project-info.md for detailed context. OpenBrain is a personal LLM work ledger built on .NET 10 + PostgreSQL 18. The active implementation plan is at .claude/memory-bank/main/plans/main-2026-03-02-openbrain-implementation.md",
+  "project": {
+    "description": "Personal LLM work ledger and memory system — tracks prompts, sessions, tool calls, artifacts across AI providers. .NET 10 Minimal API + PostgreSQL 18 + Ingestor service + MCP server.",
+    "name": "OpenBrain"
+  }
+}

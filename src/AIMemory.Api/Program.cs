@@ -341,6 +341,95 @@ app.MapGet("/api/health", async (AIMemoryDbContext db) =>
     }
 }).RequireRateLimiting("general");
 
+// ==================== Admin / Tauri DB browser ====================
+
+// Read-only inspector over the code-indexer-relevant tables. Whitelisted set only.
+// Used by the Tauri DbBrowser page; admin scope required.
+app.MapGet("/api/admin/tables/{name}", async (string name, int? limit, int? offset, AIMemoryDbContext db) =>
+{
+    var take = Math.Clamp(limit ?? 50, 1, 500);
+    var skip = Math.Max(offset ?? 0, 0);
+
+    object[] rows;
+    string[] columns;
+    int total;
+
+    switch (name)
+    {
+        case "code_repositories":
+            columns = ["RepositoryId", "Name", "SourceType", "SourcePath", "FileCount", "SymbolCount", "IndexedAt", "UpdatedAt"];
+            total = await db.CodeRepositories.CountAsync();
+            rows = (await db.CodeRepositories
+                .OrderByDescending(r => r.UpdatedAt)
+                .Skip(skip).Take(take)
+                .ToListAsync())
+                .Select(r => (object)new {
+                    r.RepositoryId, r.Name, r.SourceType, r.SourcePath,
+                    r.FileCount, r.SymbolCount, r.IndexedAt, r.UpdatedAt
+                }).ToArray();
+            break;
+
+        case "code_files":
+            columns = ["FileId", "RepositoryId", "FilePath", "Language", "FileSize", "ContentHash", "IndexedAt"];
+            total = await db.CodeFiles.CountAsync();
+            rows = (await db.CodeFiles
+                .OrderBy(f => f.FilePath)
+                .Skip(skip).Take(take)
+                .ToListAsync())
+                .Select(f => (object)new {
+                    f.FileId, f.RepositoryId, f.FilePath, f.Language,
+                    f.FileSize, f.ContentHash, f.IndexedAt
+                }).ToArray();
+            break;
+
+        case "code_symbols":
+            columns = ["SymbolId", "RepositoryId", "SymbolKey", "Name", "QualifiedName", "Kind", "StartLine", "EndLine"];
+            total = await db.CodeSymbols.CountAsync();
+            rows = (await db.CodeSymbols
+                .OrderBy(s => s.QualifiedName)
+                .Skip(skip).Take(take)
+                .ToListAsync())
+                .Select(s => (object)new {
+                    s.SymbolId, s.RepositoryId, s.SymbolKey, s.Name,
+                    s.QualifiedName, s.Kind, s.StartLine, s.EndLine
+                }).ToArray();
+            break;
+
+        case "ingestion_log":
+            columns = ["IdempotencyKey", "EventType", "Source", "SourcePath", "Status", "MachineName", "CreatedAt"];
+            total = await db.IngestionLog.CountAsync();
+            rows = (await db.IngestionLog
+                .OrderByDescending(l => l.CreatedAt)
+                .Skip(skip).Take(take)
+                .ToListAsync())
+                .Select(l => (object)new {
+                    l.IdempotencyKey, l.EventType, l.Source, l.SourcePath,
+                    l.Status, l.MachineName, l.CreatedAt
+                }).ToArray();
+            break;
+
+        default:
+            return Results.NotFound(new { error = $"Table '{name}' not in whitelist" });
+    }
+
+    return Results.Ok(new { columns, rows, total });
+}).RequireRateLimiting("general");
+
+// Recent code-indexer events for the Tauri Services page activity feed.
+app.MapGet("/api/ingestor/recent", async (int? limit, AIMemoryDbContext db) =>
+{
+    var take = Math.Clamp(limit ?? 20, 1, 200);
+    var entries = await db.IngestionLog
+        .Where(l => l.EventType == "CodeFileUpsert"
+                 || l.EventType == "CodeSymbolBatch"
+                 || l.EventType == "CodeFileDelete")
+        .OrderByDescending(l => l.CreatedAt)
+        .Take(take)
+        .Select(l => new { l.EventType, l.SourcePath, l.MachineName, l.CreatedAt })
+        .ToListAsync();
+    return Results.Ok(entries);
+}).RequireRateLimiting("general");
+
 // ==================== Stats Endpoint ====================
 
 app.MapGet("/api/stats", async (AIMemoryDbContext db) =>

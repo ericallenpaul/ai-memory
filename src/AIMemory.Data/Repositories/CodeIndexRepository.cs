@@ -105,6 +105,20 @@ public class CodeIndexRepository : ICodeIndexRepository
         await _db.SaveChangesAsync();
     }
 
+    public async Task<bool> DeleteFileAsync(Guid repositoryId, string filePath)
+    {
+        var file = await _db.CodeFiles
+            .FirstOrDefaultAsync(f => f.RepositoryId == repositoryId && f.FilePath == filePath);
+
+        if (file == null) return false;
+
+        var symbols = _db.CodeSymbols.Where(s => s.FileId == file.FileId);
+        _db.CodeSymbols.RemoveRange(symbols);
+        _db.CodeFiles.Remove(file);
+        await _db.SaveChangesAsync();
+        return true;
+    }
+
     public async Task UpsertSymbolsAsync(Guid fileId, Guid repositoryId, List<CodeSymbol> symbols)
     {
         // Remove existing symbols for this file

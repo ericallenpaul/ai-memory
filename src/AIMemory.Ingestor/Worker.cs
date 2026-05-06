@@ -86,7 +86,24 @@ public class Worker : BackgroundService
             return;
         }
 
-        var files = adapter.DiscoverFiles(sourceConfig).ToList();
+        // Bucket the enumerated files by watch path so the adapter's Reconcile pass can
+        // compute deletions per-watchpath without re-walking. Adapters that don't care
+        // about per-watchpath state (transcript adapters) still benefit from a free list.
+        var enumeratedByWatchPath = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var wp in sourceConfig.WatchPaths)
+            enumeratedByWatchPath[wp] = new List<string>();
+
+        var files = new List<string>();
+        foreach (var f in adapter.DiscoverFiles(sourceConfig))
+        {
+            files.Add(f);
+            var matchedWatchPath = sourceConfig.WatchPaths
+                .OrderByDescending(wp => wp.Length)
+                .FirstOrDefault(wp => f.StartsWith(wp, StringComparison.OrdinalIgnoreCase));
+            if (matchedWatchPath != null)
+                enumeratedByWatchPath[matchedWatchPath].Add(f);
+        }
+
         _logger.LogInformation("Source '{Source}': discovered {Count} files", sourceConfig.Name, files.Count);
 
         foreach (var filePath in files)
@@ -168,6 +185,44 @@ public class Worker : BackgroundService
                 FileMtime = fileInfo.Exists ? fileInfo.LastWriteTimeUtc : null,
                 ContentHash = lastContentHash
             });
+            _checkpointStore.Flush();
+        }
+
+        // End-of-cycle: ask the adapter for any reconciliation events (deletions, etc.)
+        // and ship them on the same batch pipeline.
+        var enumeratedView = enumeratedByWatchPath.ToDictionary(
+            kvp => kvp.Key,
+            kvp => (IReadOnlyList<string>)kvp.Value,
+            StringComparer.OrdinalIgnoreCase);
+
+        var reconcileEvents = adapter.Reconcile(sourceConfig, enumeratedView).ToList();
+        if (reconcileEvents.Count > 0)
+        {
+            _logger.LogInformation("Source '{Source}': reconcile produced {Count} events",
+                sourceConfig.Name, reconcileEvents.Count);
+
+            foreach (var batch in reconcileEvents.Chunk(_config.BatchSize))
+            {
+                var request = new BatchIngestRequest
+                {
+                    ClientId = _config.ClientId,
+                    MachineName = Environment.MachineName,
+                    Source = adapter.SourceName,
+                    Events = batch.ToList()
+                };
+
+                var result = await _client.SendBatchAsync(request, ct);
+                if (result != null)
+                {
+                    Interlocked.Add(ref _eventsIngested, result.Succeeded);
+                    Interlocked.Add(ref _eventsFailed, result.Failed);
+                }
+                else
+                {
+                    _outbox.Enqueue(request);
+                    Interlocked.Add(ref _eventsFailed, batch.Length);
+                }
+            }
             _checkpointStore.Flush();
         }
     }

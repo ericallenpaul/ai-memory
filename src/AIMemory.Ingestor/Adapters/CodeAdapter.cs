@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using AIMemory.CodeIndex.Git;
 using AIMemory.CodeIndex.Parsers;
 using AIMemory.CodeIndex.Security;
 using AIMemory.Ingestor.Checkpointing;
@@ -15,16 +16,29 @@ public class CodeAdapter : ISourceAdapter
 {
     private readonly FileFilter _fileFilter;
     private readonly ParserRegistry _parserRegistry;
+    private readonly GitChangeDetector _gitDetector;
+    private readonly ICheckpointStore _checkpointStore;
     private readonly ILogger<CodeAdapter> _logger;
     private readonly ConcurrentDictionary<string, (string Content, string Hash, FileInfo Info)> _fileCache = new();
     private readonly ConcurrentDictionary<string, string> _fileToWatchPath = new();
 
+    // Tracks which watch path was used in git mode this cycle, so Reconcile knows
+    // where to compute deletions and update the watch-path checkpoint.
+    private readonly ConcurrentDictionary<string, GitWatchState> _pendingGitState = new();
+
     public string SourceName => "code-index";
 
-    public CodeAdapter(FileFilter fileFilter, ParserRegistry parserRegistry, ILogger<CodeAdapter> logger)
+    public CodeAdapter(
+        FileFilter fileFilter,
+        ParserRegistry parserRegistry,
+        GitChangeDetector gitDetector,
+        ICheckpointStore checkpointStore,
+        ILogger<CodeAdapter> logger)
     {
         _fileFilter = fileFilter;
         _parserRegistry = parserRegistry;
+        _gitDetector = gitDetector;
+        _checkpointStore = checkpointStore;
         _logger = logger;
     }
 
@@ -38,17 +52,114 @@ public class CodeAdapter : ISourceAdapter
                 continue;
             }
 
-            foreach (var file in _fileFilter.EnumerateFiles(watchPath))
+            var isGit = _gitDetector.IsGitRepository(watchPath);
+
+            // GitOnly + non-git path: skip entirely with a warning. The user explicitly
+            // opted out of FS fallback for this watch path.
+            if (config.DetectionMode == ChangeDetectionMode.GitOnly && !isGit)
             {
-                if (!_parserRegistry.IsSupported(file))
-                    continue;
-
-                if (_fileFilter.IsBinaryFile(file))
-                    continue;
-
-                _fileToWatchPath[file] = watchPath;
-                yield return file;
+                _logger.LogWarning(
+                    "Watch path {Path} is not a git repository and DetectionMode=GitOnly — skipping",
+                    watchPath);
+                continue;
             }
+
+            var useGit = config.DetectionMode != ChangeDetectionMode.FsOnly && isGit;
+
+            if (useGit)
+            {
+                foreach (var file in EnumerateGitFiles(watchPath))
+                    yield return file;
+            }
+            else
+            {
+                foreach (var file in EnumerateFsFiles(watchPath))
+                    yield return file;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Used by Reconcile to decide which deletion-detection path to run. Mirrors the logic
+    /// in <see cref="DiscoverFiles"/>: GitOnly+non-git is treated as "this path was skipped"
+    /// so reconcile also no-ops for it.
+    /// </summary>
+    private bool ShouldUseGit(ChangeDetectionMode mode, string watchPath)
+    {
+        var isGit = _gitDetector.IsGitRepository(watchPath);
+        if (mode == ChangeDetectionMode.GitOnly && !isGit) return false; // and watch-path is skipped
+        return mode != ChangeDetectionMode.FsOnly && isGit;
+    }
+
+    private IEnumerable<string> EnumerateGitFiles(string watchPath)
+    {
+        var checkpointKey = CheckpointKey.ForWatchPath(watchPath);
+        var lastCheckpoint = _checkpointStore.GetCheckpoint(checkpointKey);
+        var lastState = lastCheckpoint?.GitHeadSha != null
+            ? new GitWatchState(
+                lastCheckpoint.GitHeadSha,
+                (lastCheckpoint.GitDirtyPaths ?? Array.Empty<string>()).ToHashSet(StringComparer.OrdinalIgnoreCase))
+            : GitWatchState.Empty;
+
+        // Capture state and candidate set up-front. If anything throws, fall back to
+        // the FS walk — but that fallback can't live in a try/catch around a yield.
+        var (currentState, candidates) = TryCaptureGitCandidates(watchPath, lastState);
+        if (currentState == null)
+        {
+            foreach (var file in EnumerateFsFiles(watchPath))
+                yield return file;
+            yield break;
+        }
+
+        _pendingGitState[watchPath] = currentState;
+
+        foreach (var absPath in candidates!)
+        {
+            // Apply the same filters as filesystem mode so we don't yield .git internals,
+            // node_modules, binary files, or unsupported extensions.
+            if (!File.Exists(absPath)) continue;
+            if (!_parserRegistry.IsSupported(absPath)) continue;
+            if (_fileFilter.IsPathExcluded(absPath, watchPath)) continue;
+            if (_fileFilter.IsBinaryFile(absPath)) continue;
+
+            _fileToWatchPath[absPath] = watchPath;
+            yield return absPath;
+        }
+    }
+
+    private (GitWatchState? state, IEnumerable<string>? candidates) TryCaptureGitCandidates(
+        string watchPath, GitWatchState lastState)
+    {
+        try
+        {
+            var state = _gitDetector.GetCurrentState(watchPath);
+            // Materialize the candidate list now so any libgit2 errors surface here, not
+            // mid-iteration in the caller. A list per scan is fine — the count is bounded
+            // by changed files, not repo size.
+            var candidates = string.IsNullOrEmpty(lastState.HeadSha)
+                ? _gitDetector.EnumerateAllFiles(watchPath).ToList()
+                : _gitDetector.ChangedSince(watchPath, lastState).ToList();
+            return (state, candidates);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Git enumeration failed for {Path} — falling back to filesystem walk", watchPath);
+            return (null, null);
+        }
+    }
+
+    private IEnumerable<string> EnumerateFsFiles(string watchPath)
+    {
+        foreach (var file in _fileFilter.EnumerateFiles(watchPath))
+        {
+            if (!_parserRegistry.IsSupported(file))
+                continue;
+
+            if (_fileFilter.IsBinaryFile(file))
+                continue;
+
+            _fileToWatchPath[file] = watchPath;
+            yield return file;
         }
     }
 
@@ -172,6 +283,119 @@ public class CodeAdapter : ISourceAdapter
                     Payload = JsonSerializer.SerializeToElement(symbolEvent)
                 };
             }
+        }
+    }
+
+    /// <summary>
+    /// End-of-cycle hook. Two responsibilities:
+    /// <list type="number">
+    ///   <item>Emit <see cref="CodeFileDeleteEvent"/>s for files that disappeared since last scan.
+    ///         Git mode uses libgit2 diff; FS mode compares against the last enumerated set.</item>
+    ///   <item>Persist the per-watchpath checkpoint (HEAD sha, dirty paths, last enumeration)
+    ///         so the next cycle has a baseline to diff against.</item>
+    /// </list>
+    /// </summary>
+    public IEnumerable<IngestEvent> Reconcile(
+        SourceConfig config,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> enumeratedFilesByWatchPath)
+    {
+        foreach (var watchPath in config.WatchPaths)
+        {
+            if (!Directory.Exists(watchPath)) continue;
+
+            var enumerated = enumeratedFilesByWatchPath.TryGetValue(watchPath, out var list)
+                ? list
+                : Array.Empty<string>();
+
+            var repoName = Path.GetFileName(watchPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            var checkpointKey = CheckpointKey.ForWatchPath(watchPath);
+            var lastCheckpoint = _checkpointStore.GetCheckpoint(checkpointKey);
+            var useGit = ShouldUseGit(config.DetectionMode, watchPath);
+
+            var deletedRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (useGit)
+            {
+                // Git mode: ask libgit2 for deletions between last-seen HEAD and now.
+                if (lastCheckpoint?.GitHeadSha != null)
+                {
+                    var lastState = new GitWatchState(
+                        lastCheckpoint.GitHeadSha,
+                        (lastCheckpoint.GitDirtyPaths ?? Array.Empty<string>()).ToHashSet(StringComparer.OrdinalIgnoreCase));
+
+                    try
+                    {
+                        foreach (var rel in _gitDetector.EnumerateDeletions(watchPath, lastState))
+                            deletedRelativePaths.Add(rel);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "EnumerateDeletions failed for {Path}", watchPath);
+                    }
+                }
+            }
+            else
+            {
+                // FS mode: filesystem is the boss. Anything in the previous enumeration that
+                // isn't in the current enumeration (and doesn't exist on disk anymore) is gone.
+                var previous = lastCheckpoint?.LastEnumeratedFiles ?? Array.Empty<string>();
+                var currentSet = enumerated
+                    .Select(abs => Path.GetRelativePath(watchPath, abs).Replace('\\', '/'))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var rel in previous)
+                {
+                    if (!currentSet.Contains(rel))
+                    {
+                        var abs = Path.Combine(watchPath, rel.Replace('/', Path.DirectorySeparatorChar));
+                        if (!File.Exists(abs))
+                            deletedRelativePaths.Add(rel);
+                    }
+                }
+            }
+
+            foreach (var rel in deletedRelativePaths)
+            {
+                // Filter out files we wouldn't have indexed in the first place — no point
+                // emitting a delete for, say, an unsupported extension that's now gone.
+                if (!_parserRegistry.IsSupported(rel)) continue;
+
+                var deleteEvent = new CodeFileDeleteEvent
+                {
+                    RepositoryName = repoName,
+                    FilePath = rel,
+                    MachineName = Environment.MachineName
+                };
+
+                yield return new IngestEvent
+                {
+                    Type = "CodeFileDelete",
+                    // Idempotency key includes a timestamp tick so re-emitting a delete (e.g.
+                    // because the API didn't ack the first one) doesn't collide with the prior
+                    // entry; the API's effect is idempotent regardless.
+                    IdempotencyKey = $"code-delete|{watchPath}|{rel}|{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}",
+                    Payload = JsonSerializer.SerializeToElement(deleteEvent)
+                };
+            }
+
+            // Persist watch-path checkpoint for next cycle. Both git and FS modes record
+            // the enumerated relative-path list so we can recover deletion detection if
+            // git state is lost (e.g. user toggles modes).
+            var newCheckpoint = new Checkpoint
+            {
+                LastSeenAt = DateTimeOffset.UtcNow,
+                LastEnumeratedFiles = enumerated
+                    .Select(abs => Path.GetRelativePath(watchPath, abs).Replace('\\', '/'))
+                    .ToArray()
+            };
+
+            if (useGit && _pendingGitState.TryRemove(watchPath, out var gitState))
+            {
+                newCheckpoint.GitHeadSha = gitState.HeadSha;
+                newCheckpoint.GitDirtyPaths = gitState.DirtyPaths.ToArray();
+            }
+
+            _checkpointStore.SaveCheckpoint(checkpointKey, newCheckpoint);
         }
     }
 

@@ -20,6 +20,25 @@ public class SourceConfig
     public List<string> WatchPaths { get; set; } = [];
     public List<string> FilePatterns { get; set; } = [];
     public string Segment { get; set; } = "personal";
+
+    /// <summary>
+    /// Code-adapter-only: how to detect file changes within each WatchPath.
+    /// <list type="bullet">
+    ///   <item><c>Auto</c> (default) — use git when the path is a git repo, fall back to filesystem walk otherwise.</item>
+    ///   <item><c>GitOnly</c> — require a git repo; non-git watch paths are skipped with a warning.</item>
+    ///   <item><c>FsOnly</c> — always use the filesystem walk, even if the path is a git repo.</item>
+    /// </list>
+    /// Filesystem mtime/size/hash detection still runs inside whichever set git (or the walk) hands back —
+    /// git is a tier-0 filter, not a replacement for content-hash verification.
+    /// </summary>
+    public ChangeDetectionMode DetectionMode { get; set; } = ChangeDetectionMode.Auto;
+}
+
+public enum ChangeDetectionMode
+{
+    Auto = 0,
+    GitOnly = 1,
+    FsOnly = 2
 }
 
 public class RedactionConfig

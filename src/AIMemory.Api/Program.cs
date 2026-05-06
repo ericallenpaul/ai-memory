@@ -767,6 +767,22 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                     }
                     break;
 
+                case "CodeFileDelete":
+                    var codeDeleteEvt = JsonSerializer.Deserialize<CodeFileDeleteEvent>(
+                        evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (codeDeleteEvt != null)
+                    {
+                        var delRepo = await codeIndexRepo.GetRepositoryByNameAsync(codeDeleteEvt.RepositoryName);
+                        if (delRepo != null)
+                        {
+                            var removed = await codeIndexRepo.DeleteFileAsync(delRepo.RepositoryId, codeDeleteEvt.FilePath);
+                            if (removed)
+                                await codeIndexRepo.UpdateRepositoryStatsAsync(delRepo.RepositoryId);
+                        }
+                        // Missing repo or missing file is not an error — the delete is idempotent.
+                    }
+                    break;
+
                 case "CodeSymbolBatch":
                     var symBatchEvt = JsonSerializer.Deserialize<CodeSymbolBatchEvent>(
                         evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });

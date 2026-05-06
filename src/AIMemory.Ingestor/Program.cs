@@ -6,6 +6,7 @@ using AIMemory.Ingestor.Checkpointing;
 using AIMemory.Ingestor.Configuration;
 using AIMemory.Ingestor.Redaction;
 using AIMemory.Ingestor.Transport;
+using AIMemory.CodeIndex.Git;
 using AIMemory.CodeIndex.Parsers;
 using AIMemory.CodeIndex.Security;
 
@@ -89,6 +90,7 @@ builder.Services.AddSingleton<ILanguageParser, TypeScriptParser>();
 builder.Services.AddSingleton<ILanguageParser, GoParser>();
 builder.Services.AddSingleton<ParserRegistry>(sp =>
     new ParserRegistry(sp.GetServices<ILanguageParser>()));
+builder.Services.AddSingleton<GitChangeDetector>();
 builder.Services.AddSingleton<ISourceAdapter, CodeAdapter>();
 
 // HTTP Client with Polly retry

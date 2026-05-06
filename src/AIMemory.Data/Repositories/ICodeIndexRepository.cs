@@ -11,6 +11,7 @@ public interface ICodeIndexRepository
     Task DeleteRepositoryAsync(Guid id);
     Task UpsertFileAsync(CodeFile file);
     Task DeleteStaleFilesAsync(Guid repositoryId, IEnumerable<string> currentFilePaths);
+    Task<bool> DeleteFileAsync(Guid repositoryId, string filePath);
     Task UpsertSymbolsAsync(Guid fileId, Guid repositoryId, List<CodeSymbol> symbols);
     Task<List<CodeFile>> GetFileTreeAsync(Guid repositoryId);
     Task<List<CodeSymbol>> GetFileOutlineAsync(Guid repositoryId, string filePath);

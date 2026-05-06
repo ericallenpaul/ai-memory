@@ -10,6 +10,22 @@ public interface ISourceAdapter
     IEnumerable<string> DiscoverFiles(SourceConfig config);
     IEnumerable<RawRecord> ReadNewRecords(string filePath, Checkpoint? checkpoint);
     IEnumerable<IngestEvent> ParseRecord(RawRecord raw);
+
+    /// <summary>
+    /// Called once per source per scan cycle, after all per-file processing has finished.
+    /// Adapters that need end-of-cycle work (reconciling deletions against the last-seen
+    /// file set, advancing per-watchpath state, etc.) implement this. The default returns
+    /// nothing — log/transcript adapters don't need it.
+    /// </summary>
+    /// <remarks>
+    /// The <paramref name="enumeratedFilesByWatchPath"/> map gives each adapter the list
+    /// of files DiscoverFiles yielded for each watch path during the just-completed scan,
+    /// so it doesn't have to re-walk to compute deletions.
+    /// </remarks>
+    IEnumerable<IngestEvent> Reconcile(
+        SourceConfig config,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> enumeratedFilesByWatchPath)
+        => Array.Empty<IngestEvent>();
 }
 
 public class RawRecord

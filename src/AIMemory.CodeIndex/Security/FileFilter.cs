@@ -86,6 +86,38 @@ public class FileFilter
         return EnumerateFilesRecursive(root, root);
     }
 
+    /// <summary>
+    /// True if any segment of <paramref name="filePath"/> below <paramref name="rootPath"/>
+    /// is an excluded directory (.git, node_modules, bin, obj, etc.) or if the file itself
+    /// fails <see cref="ShouldIncludeFile"/>. Used by callers that don't go through
+    /// <see cref="EnumerateFiles"/> (e.g. the git tier in CodeAdapter, which gets paths
+    /// directly from libgit2).
+    /// </summary>
+    public bool IsPathExcluded(string filePath, string rootPath)
+    {
+        var rel = Path.GetRelativePath(rootPath, filePath);
+        if (rel == "." || string.IsNullOrEmpty(rel)) return false;
+
+        foreach (var segment in rel.Split('/', '\\'))
+        {
+            if (string.IsNullOrEmpty(segment) || segment == ".") continue;
+            if (!ShouldIncludeDirectory(segment)
+                && Path.GetExtension(segment) == string.Empty)
+            {
+                // Treat as directory only if it has no extension (best-effort heuristic;
+                // ".git" is the only common name with a dot that we exclude, and it's
+                // explicitly in the excluded set anyway).
+                return true;
+            }
+            if (segment.Equals(".git", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        if (!File.Exists(filePath)) return false;
+        var info = new FileInfo(filePath);
+        return !ShouldIncludeFile(filePath, info.Length);
+    }
+
     private IEnumerable<string> EnumerateFilesRecursive(string directory, string rootPath)
     {
         string[] entries;

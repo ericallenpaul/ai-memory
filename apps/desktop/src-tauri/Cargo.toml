@@ -21,6 +21,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# Blocking HTTP client used by the distributed-mode admin commands. The local API's TLS cert
+# is self-signed (Phase 7a §3.6) so we accept invalid certs explicitly when we know we're
+# talking to ourselves on loopback.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 # Windows Service Control Manager bindings; only used on Windows targets.
 [target.'cfg(windows)'.dependencies]

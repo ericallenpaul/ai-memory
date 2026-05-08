@@ -10,6 +10,13 @@ export interface RuntimeConfig {
   baseUrl: string;
   apiKey: string;
   port: number;
+  /** Phase 7a additions — `bind_interface`, `bind_port`, `tls_fingerprint` are written by
+   *  the API service so the desktop UI can render the Distributed page without re-reading
+   *  `distributed.json`. Older API service builds may not write these; defaults match the
+   *  Rust-side serde defaults (loopback, port 0, empty fingerprint). */
+  bind_interface?: string;
+  bind_port?: number;
+  tls_fingerprint?: string;
 }
 
 type ApiState =

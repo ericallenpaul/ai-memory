@@ -10,7 +10,12 @@
 //!   via the SCM (no UAC prompts during normal use; install/uninstall is
 //!   the installer's job).
 //! * [`pick_folder`] — folder picker for "Add watch path".
+//! * [`distributed_status`], [`distributed_enable`], [`distributed_disable`],
+//!   [`pairings_list`], [`pairings_revoke`], [`list_network_interfaces`]
+//!   — phase 8 admin surface for the "Allow remote ingestors" page; thin proxies over
+//!   the local API's `/api/admin/distributed/*` and `/api/pairings*` endpoints.
 
+mod distributed;
 mod runtime;
 mod services;
 
@@ -58,8 +63,46 @@ async fn service_stop(name: services::ServiceName) -> Result<(), DesktopError> {
 async fn service_restart(name: services::ServiceName) -> Result<(), DesktopError> {
     services::stop(name)?;
     // Brief pause to let SCM transition through STOP_PENDING before we re-issue Start.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Phase 8 enable flow re-uses this for the "Restart now" affordance, so the wait is
+    // sized generously enough to clear most reasonable Kestrel teardowns.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     services::start(name)
+}
+
+// ==================== Distributed-mode admin (phase 8) ====================
+//
+// These are async tauri commands so the blocking reqwest calls execute on Tauri's command
+// thread pool rather than blocking the UI thread. Each one returns a JSON value that the
+// React side parses into the typed shapes declared in `apps/desktop/src/api/distributed.ts`.
+
+#[tauri::command]
+async fn distributed_status() -> Result<serde_json::Value, DesktopError> {
+    distributed::status()
+}
+
+#[tauri::command]
+async fn distributed_enable(args: distributed::EnableArgs) -> Result<serde_json::Value, DesktopError> {
+    distributed::enable(args)
+}
+
+#[tauri::command]
+async fn distributed_disable() -> Result<serde_json::Value, DesktopError> {
+    distributed::disable()
+}
+
+#[tauri::command]
+async fn pairings_list() -> Result<serde_json::Value, DesktopError> {
+    distributed::pairings_list()
+}
+
+#[tauri::command]
+async fn pairings_revoke(id: String) -> Result<serde_json::Value, DesktopError> {
+    distributed::pairings_revoke(&id)
+}
+
+#[tauri::command]
+fn list_network_interfaces() -> Vec<distributed::NetworkInterface> {
+    distributed::list_network_interfaces()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -74,6 +117,12 @@ pub fn run() {
             service_start,
             service_stop,
             service_restart,
+            distributed_status,
+            distributed_enable,
+            distributed_disable,
+            pairings_list,
+            pairings_revoke,
+            list_network_interfaces,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

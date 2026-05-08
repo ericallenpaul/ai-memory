@@ -20,7 +20,11 @@ export function Settings() {
             <tbody>
               <tr><th>Base URL</th><td className="mono">{config.baseUrl}</td></tr>
               <tr><th>Port</th><td className="mono">{config.port}</td></tr>
+              <tr><th>Bind interface</th><td className="mono">{config.bind_interface || "127.0.0.1"}</td></tr>
               <tr><th>API key</th><td className="mono">{config.apiKey.slice(0, 16)}…</td></tr>
+              {config.tls_fingerprint && (
+                <tr><th>TLS fingerprint</th><td className="mono" style={{ wordBreak: "break-all" }}>{config.tls_fingerprint}</td></tr>
+              )}
             </tbody>
           </table>
         )}

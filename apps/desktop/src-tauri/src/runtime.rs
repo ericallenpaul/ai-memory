@@ -9,7 +9,8 @@ use crate::DesktopError;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    /// Base URL of the local API, e.g. `http://127.0.0.1:5219`.
+    /// Base URL of the local API, e.g. `http://127.0.0.1:5219` (or `https://...` when
+    /// distributed mode is on).
     #[serde(rename = "baseUrl")]
     pub base_url: String,
 
@@ -20,6 +21,26 @@ pub struct RuntimeConfig {
 
     /// Port number split out for convenience (some callers prefer the bare port).
     pub port: u16,
+
+    /// Bind interface the API listener is currently using. Phase 7a writes this from
+    /// `distributed.json`'s `BindAddress` so the desktop UI can render the Distributed
+    /// settings page without re-reading that file. Defaults to `"127.0.0.1"` for back-compat
+    /// with older runtime.json files.
+    #[serde(default = "default_bind_interface")]
+    pub bind_interface: String,
+
+    /// Bind port (mirrors `port`, kept here for symmetry with the on-disk schema).
+    #[serde(default)]
+    pub bind_port: u16,
+
+    /// Lowercase-hex SHA-256 of the leaf TLS cert's DER bytes, or empty when distributed
+    /// mode is disabled (no cert generated yet).
+    #[serde(default)]
+    pub tls_fingerprint: String,
+}
+
+fn default_bind_interface() -> String {
+    "127.0.0.1".to_string()
 }
 
 pub fn runtime_config_path() -> PathBuf {

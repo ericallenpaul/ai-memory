@@ -1,9 +1,11 @@
 using NLog;
 using NLog.Extensions.Logging;
+using AIMemory.Identity;
 using AIMemory.Ingestor;
 using AIMemory.Ingestor.Adapters;
 using AIMemory.Ingestor.Checkpointing;
 using AIMemory.Ingestor.Configuration;
+using AIMemory.Ingestor.Hashing;
 using AIMemory.Ingestor.Redaction;
 using AIMemory.Ingestor.Transport;
 using AIMemory.CodeIndex.Git;
@@ -39,9 +41,23 @@ builder.Services.Configure<IngestorConfig>(builder.Configuration.GetSection("Ing
 var config = new IngestorConfig();
 builder.Configuration.GetSection("Ingestor").Bind(config);
 
-// Override from env
+// Override from env (local mode only — remote uses Ingestor.Remote.* settings)
 config.ApiKey = Environment.GetEnvironmentVariable("AIMEMORY_API_KEY") ?? config.ApiKey;
 var apiUrl = Environment.GetEnvironmentVariable("AIMEMORY_API_URL") ?? config.AIMemoryApiBaseUrl;
+
+// Validate the resolved configuration. Remote mode without all three remote fields is a
+// fail-fast at startup — better than silently misbehaving on the first batch.
+try
+{
+    IngestorConfigValidator.Validate(config);
+}
+catch (IngestorConfigurationException ex)
+{
+    Console.Error.WriteLine($"FATAL: ingestor configuration is invalid: {ex.Message}");
+    NLog.LogManager.Shutdown();
+    Environment.Exit(78); // EX_CONFIG (sysexits)
+    return;
+}
 
 // Auto-discover API port from port file if URL is not configured
 if (string.IsNullOrWhiteSpace(apiUrl))
@@ -93,14 +109,57 @@ builder.Services.AddSingleton<ParserRegistry>(sp =>
 builder.Services.AddSingleton<GitChangeDetector>();
 builder.Services.AddSingleton<ISourceAdapter, CodeAdapter>();
 
-// HTTP Client with Polly retry
-builder.Services.AddHttpClient<IAIMemoryClient, AIMemoryHttpClient>(client =>
+// Streaming SHA-256 hasher — used by CodeAdapter for content_sha256 derivation.
+builder.Services.AddSingleton<IFileHasher, StreamingFileHasher>();
+
+// Identity (host_id + project_id). InstallSaltStore is rooted at the platform default — the
+// API service generates the salt on first run; the ingestor is happy to read whatever it finds.
+// On a remote-only install where the API isn't present, the ingestor still has its own
+// per-machine salt (a fallback path under %ProgramData% / %APPDATA%).
+var saltDir = OperatingSystem.IsWindows()
+    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "AIMemory", "Ingestor")
+    : InstallSaltStore.GetDefaultDirectory();
+Directory.CreateDirectory(saltDir);
+builder.Services.AddSingleton<IInstallSaltStore>(_ => new InstallSaltStore(saltDir));
+builder.Services.AddSingleton<IHostIdProvider, HostIdProvider>();
+builder.Services.AddSingleton<IProjectIdResolver, ProjectIdResolver>();
+builder.Services.AddSingleton<IIngestorContext, IngestorContext>();
+
+// Sink wiring. Local mode keeps the existing HTTP-loopback behavior unchanged; remote mode
+// uses the fingerprint-pinned HTTPS client.
+if (config.Mode == IngestorMode.Remote)
 {
-    client.BaseAddress = new Uri(apiUrl);
-    client.Timeout = TimeSpan.FromSeconds(30);
-    if (!string.IsNullOrEmpty(config.ApiKey))
-        client.DefaultRequestHeaders.Add("X-API-Key", config.ApiKey);
-});
+    startupLogger.Info("Ingestor mode: REMOTE (endpoint={Endpoint})", config.Remote.Endpoint);
+
+    var remoteClient = RemoteSinkHttpClientBuilder.Build(config.Remote);
+    builder.Services.AddSingleton(remoteClient);
+    builder.Services.AddSingleton<ILedgerSink>(sp =>
+        new RemoteSink(remoteClient, sp.GetService<ILogger<RemoteSink>>()));
+}
+else
+{
+    startupLogger.Info("Ingestor mode: LOCAL (loopback to {Url})", apiUrl);
+
+    builder.Services.AddHttpClient<IAIMemoryClient, AIMemoryHttpClient>(client =>
+    {
+        // Tolerate an empty apiUrl at registration time — preserves the pre-7b behavior
+        // where the ingestor starts up and warns even if the API URL hasn't been resolved
+        // yet. Calls will fail at send time, which the LocalSink translates to a transient
+        // failure and the worker queues to the outbox.
+        if (!string.IsNullOrWhiteSpace(apiUrl))
+            client.BaseAddress = new Uri(apiUrl);
+        client.Timeout = TimeSpan.FromSeconds(30);
+        if (!string.IsNullOrEmpty(config.ApiKey))
+        {
+            // Phase 7a moved the API to the new header name. Local-loopback still gets the
+            // bypass when no key is sent, but if a key is configured we send it under the new
+            // header so the auth path actually validates the key.
+            client.DefaultRequestHeaders.Add(RemoteSink.ApiKeyHeaderName, config.ApiKey);
+        }
+    });
+
+    builder.Services.AddSingleton<ILedgerSink, LocalSink>();
+}
 
 // Outbox
 var outboxPath = !string.IsNullOrEmpty(config.Outbox.Path) ? config.Outbox.Path

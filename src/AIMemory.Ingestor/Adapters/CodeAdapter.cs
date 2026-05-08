@@ -1,12 +1,11 @@
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using AIMemory.CodeIndex.Git;
 using AIMemory.CodeIndex.Parsers;
 using AIMemory.CodeIndex.Security;
 using AIMemory.Ingestor.Checkpointing;
 using AIMemory.Ingestor.Configuration;
+using AIMemory.Ingestor.Hashing;
 using AIMemory.Models.Dtos;
 using AIMemory.Models.Events;
 
@@ -18,6 +17,7 @@ public class CodeAdapter : ISourceAdapter
     private readonly ParserRegistry _parserRegistry;
     private readonly GitChangeDetector _gitDetector;
     private readonly ICheckpointStore _checkpointStore;
+    private readonly IFileHasher _fileHasher;
     private readonly ILogger<CodeAdapter> _logger;
     private readonly ConcurrentDictionary<string, (string Content, string Hash, FileInfo Info)> _fileCache = new();
     private readonly ConcurrentDictionary<string, string> _fileToWatchPath = new();
@@ -33,13 +33,17 @@ public class CodeAdapter : ISourceAdapter
         ParserRegistry parserRegistry,
         GitChangeDetector gitDetector,
         ICheckpointStore checkpointStore,
-        ILogger<CodeAdapter> logger)
+        ILogger<CodeAdapter> logger,
+        IFileHasher? fileHasher = null)
     {
         _fileFilter = fileFilter;
         _parserRegistry = parserRegistry;
         _gitDetector = gitDetector;
         _checkpointStore = checkpointStore;
         _logger = logger;
+        // Default to the streaming hasher when DI doesn't provide one. Constructor argument
+        // is optional so existing tests that hand-build the adapter don't have to be edited.
+        _fileHasher = fileHasher ?? new StreamingFileHasher();
     }
 
     public IEnumerable<string> DiscoverFiles(SourceConfig config)
@@ -177,11 +181,13 @@ public class CodeAdapter : ISourceAdapter
             yield break;
         }
 
-        // Tier 2: content hash check — read file and compare hash
-        string content;
+        // Tier 2: content hash check — read file's raw bytes once, derive hash + decoded text.
+        // Hash is computed over the actual file bytes (per design doc §2.3) rather than UTF-8
+        // round-tripped text, so a file with a UTF-8 BOM or non-ASCII bytes hashes as itself.
+        byte[] rawBytes;
         try
         {
-            content = File.ReadAllText(filePath);
+            rawBytes = File.ReadAllBytes(filePath);
         }
         catch (Exception ex)
         {
@@ -189,7 +195,10 @@ public class CodeAdapter : ISourceAdapter
             yield break;
         }
 
-        var hash = ComputeSha256(content);
+        var hash = _fileHasher.HashBytes(rawBytes);
+        // Decode for the parser. UTF-8 with BOM detection matches what File.ReadAllText did
+        // before, so symbol parsing is unaffected.
+        var content = System.Text.Encoding.UTF8.GetString(StripUtf8Bom(rawBytes));
 
         // If mtime changed but content is identical, skip (touch-only change)
         if (checkpoint?.ContentHash != null && checkpoint.ContentHash == hash)
@@ -228,13 +237,15 @@ public class CodeAdapter : ISourceAdapter
 
         var language = _parserRegistry.GetLanguage(raw.FilePath) ?? "unknown";
 
-        // Emit CodeFileUpsert event
+        // Emit CodeFileUpsert event. RelPath is the v2 field (per design doc §3.3); FilePath
+        // is kept populated for backcompat with v1 primaries during the migration window.
         var fileEvent = new CodeFileUpsertEvent
         {
             RepositoryName = repoName,
             SourceType = "local",
             SourcePath = watchPath,
             FilePath = relativePath,
+            RelPath = relativePath,
             Language = language,
             FileSize = fileInfo.Length,
             ContentHash = hash,
@@ -364,6 +375,7 @@ public class CodeAdapter : ISourceAdapter
                 {
                     RepositoryName = repoName,
                     FilePath = rel,
+                    RelPath = rel,
                     MachineName = Environment.MachineName
                 };
 
@@ -399,9 +411,15 @@ public class CodeAdapter : ISourceAdapter
         }
     }
 
-    private static string ComputeSha256(string content)
+    /// <summary>
+    /// Returns the raw bytes minus a leading UTF-8 BOM (<c>EF BB BF</c>) if present. The hash
+    /// is computed over the original bytes <em>including</em> the BOM (that's what disk says),
+    /// but the parser expects a BOM-free string — same shape as <see cref="File.ReadAllText(string)"/>.
+    /// </summary>
+    private static ReadOnlySpan<byte> StripUtf8Bom(byte[] bytes)
     {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(content));
-        return Convert.ToHexStringLower(bytes);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            return new ReadOnlySpan<byte>(bytes, 3, bytes.Length - 3);
+        return bytes;
     }
 }

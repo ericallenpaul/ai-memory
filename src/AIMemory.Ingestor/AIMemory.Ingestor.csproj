@@ -21,5 +21,6 @@
   <ItemGroup>
     <ProjectReference Include="..\AIMemory.Models\AIMemory.Models.csproj" />
     <ProjectReference Include="..\AIMemory.CodeIndex\AIMemory.CodeIndex.csproj" />
+    <ProjectReference Include="..\AIMemory.Identity\AIMemory.Identity.csproj" />
   </ItemGroup>
 </Project>

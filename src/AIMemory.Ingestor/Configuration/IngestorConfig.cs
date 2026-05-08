@@ -10,6 +10,49 @@ public class IngestorConfig
     public int BatchSize { get; set; } = 100;
     public RedactionConfig Redaction { get; set; } = new();
     public OutboxConfig Outbox { get; set; } = new();
+
+    /// <summary>
+    /// Operating mode for this ingestor. <see cref="IngestorMode.Local"/> targets a primary
+    /// running on the same machine (today: HTTP loopback through the existing client).
+    /// <see cref="IngestorMode.Remote"/> talks to a remote primary over HTTPS with a pinned
+    /// certificate fingerprint.
+    /// </summary>
+    public IngestorMode Mode { get; set; } = IngestorMode.Local;
+
+    /// <summary>
+    /// Settings used when <see cref="Mode"/> is <see cref="IngestorMode.Remote"/>. Required
+    /// fields are validated at startup — see <c>RemoteSinkConfigValidator</c>.
+    /// </summary>
+    public RemoteSinkConfig Remote { get; set; } = new();
+}
+
+/// <summary>
+/// Selects the <c>ILedgerSink</c> implementation. Bound from configuration as a string;
+/// values are case-insensitive (<c>"local"</c> or <c>"remote"</c>).
+/// </summary>
+public enum IngestorMode
+{
+    Local = 0,
+    Remote = 1
+}
+
+/// <summary>
+/// Configuration for the remote-mode <c>RemoteSink</c>. All three fields are required when
+/// <see cref="IngestorConfig.Mode"/> is <see cref="IngestorMode.Remote"/>.
+/// </summary>
+public class RemoteSinkConfig
+{
+    /// <summary>Base URL of the paired primary, e.g. <c>https://eric-desktop.lan:5219</c>.</summary>
+    public string Endpoint { get; set; } = string.Empty;
+
+    /// <summary>Ingest-scoped API key issued by the primary's pairing flow.</summary>
+    public string ApiKey { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Pinned SHA-256 fingerprint of the primary's leaf TLS certificate. Lowercase hex of the
+    /// DER bytes (no colons), or with colons — the validator accepts either.
+    /// </summary>
+    public string PinnedCertFingerprint { get; set; } = string.Empty;
 }
 
 public class SourceConfig

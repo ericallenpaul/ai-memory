@@ -9,6 +9,16 @@ namespace AIMemory.Models.Events;
 public class CodeFileDeleteEvent
 {
     public string RepositoryName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Legacy path field — see <c>CodeFileUpsertEvent.FilePath</c> for the same compat note.
+    /// </summary>
     public string FilePath { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Project-root-relative path, POSIX-style. Supersedes <see cref="FilePath"/> on v2.
+    /// </summary>
+    public string? RelPath { get; set; }
+
     public string? MachineName { get; set; }
 }

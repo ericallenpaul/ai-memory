@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run prepublish:dotnet && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -33,6 +33,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "bundle-resources/api/": "api/",
+      "bundle-resources/ingestor/": "ingestor/"
+    },
     "windows": {
       "nsis": {
         "installerHooks": "./installer/installer.nsh",

@@ -144,17 +144,22 @@ FunctionEnd
   ;     services were registered without re-prompting.
   WriteRegStr HKLM "Software\AIMemory" "InstallMode" "$AIMemoryInstallMode"
 
+  ; Phase 11: the .NET service binaries are bundled via tauri.conf.json's
+  ; bundle.resources map, which lands them at $INSTDIR\resources\api\ and
+  ; $INSTDIR\resources\ingestor\. The installer.nsh hook below references those
+  ; paths when registering services. (Pre-phase-11 hooks pointed at $INSTDIR\
+  ; root, which never actually contained the .NET binaries -- the bundle copied
+  ; only the Tauri shell.)
+  StrCpy $2 "$INSTDIR\resources\api\AIMemory.Api.exe"
+  StrCpy $3 "$INSTDIR\resources\ingestor\AIMemory.Ingestor.exe"
+
   ${If} $AIMemoryInstallMode == "ingestor-only"
-    ; Tauri's File commands already copied AIMemory.Api.* into $INSTDIR. We
-    ; remove them here so the install dir reflects the user's selection and
-    ; troubleshooting on a remote node isn't muddied by an unused API binary.
-    ; If a particular file isn't present (future builds may not bundle it)
-    ; the Delete is a no-op.
+    ; Phase 11: in ingestor-only mode, drop the API resource tree so the install
+    ; dir reflects the user's selection. The Tauri-template-copied resource dir
+    ; is removed here; if a future build skips the API publish entirely, this is
+    ; a no-op.
     DetailPrint "Pruning API binaries (ingestor-only mode)..."
-    Delete "$INSTDIR\AIMemory.Api.exe"
-    Delete "$INSTDIR\AIMemory.Api.pdb"
-    Delete "$INSTDIR\AIMemory.Api.dll"
-    Delete "$INSTDIR\AIMemory.Api.xml"
+    RMDir /r "$INSTDIR\resources\api"
 
     ; Replace the Tauri-created Start Menu shortcut with one named for the
     ; ingestor wizard. Same exe target -- the shell detects mode from
@@ -166,10 +171,10 @@ FunctionEnd
 
     ; Register only the ingestor service. No `depend=` on aimemory-api since
     ; the API isn't running on this machine.
-    DetailPrint "Registering aimemory-ingestor service..."
+    DetailPrint "Registering aimemory-ingestor service ($3)..."
     ExecWait 'sc.exe stop aimemory-ingestor'
     ExecWait 'sc.exe delete aimemory-ingestor'
-    ExecWait 'sc.exe create aimemory-ingestor binPath= "\"$INSTDIR\AIMemory.Ingestor.exe\"" start= auto DisplayName= "AIMemory Ingestor"'
+    ExecWait 'sc.exe create aimemory-ingestor binPath= "\"$3\"" start= auto DisplayName= "AIMemory Ingestor"'
     ExecWait 'sc.exe description aimemory-ingestor "Watches configured paths and pushes code-index events to a remote AIMemory API."'
 
     ; Don't auto-start the ingestor in ingestor-only mode -- the wizard will
@@ -177,16 +182,16 @@ FunctionEnd
     DetailPrint "Skipping service start (wizard will start ingestor after pairing)."
   ${Else}
     ; Full install: everything stays. Original phase 2 behavior.
-    DetailPrint "Registering aimemory-api service..."
+    DetailPrint "Registering aimemory-api service ($2)..."
     ExecWait 'sc.exe stop aimemory-api'
     ExecWait 'sc.exe delete aimemory-api'
-    ExecWait 'sc.exe create aimemory-api binPath= "\"$INSTDIR\AIMemory.Api.exe\"" start= auto DisplayName= "AIMemory API"'
+    ExecWait 'sc.exe create aimemory-api binPath= "\"$2\"" start= auto DisplayName= "AIMemory API"'
     ExecWait 'sc.exe description aimemory-api "Local code-indexer HTTP API for the AIMemory Desktop control panel."'
 
-    DetailPrint "Registering aimemory-ingestor service..."
+    DetailPrint "Registering aimemory-ingestor service ($3)..."
     ExecWait 'sc.exe stop aimemory-ingestor'
     ExecWait 'sc.exe delete aimemory-ingestor'
-    ExecWait 'sc.exe create aimemory-ingestor binPath= "\"$INSTDIR\AIMemory.Ingestor.exe\"" start= auto DisplayName= "AIMemory Ingestor" depend= aimemory-api'
+    ExecWait 'sc.exe create aimemory-ingestor binPath= "\"$3\"" start= auto DisplayName= "AIMemory Ingestor" depend= aimemory-api'
     ExecWait 'sc.exe description aimemory-ingestor "Watches configured paths and pushes code-index events to the AIMemory API."'
 
     DetailPrint "Starting services..."

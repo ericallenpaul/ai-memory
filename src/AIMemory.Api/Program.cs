@@ -687,16 +687,42 @@ app.MapDelete("/api/pairings/{id:guid}", async (Guid id,
 // ==================== Distributed admin toggle (phase 7a) ====================
 
 app.MapPost("/api/admin/distributed/enable", async (
+    string? bindInterface,
     DistributedConfigStore configStore, TlsCertificateProvider tlsProvider,
     IApiKeyRepository keyRepo, HttpContext httpContext, ILoggerFactory loggerFactory) =>
 {
     var distLogger = loggerFactory.CreateLogger("AIMemory.Api.Distributed");
+
+    // Phase 11: validate the user-supplied bindInterface before mutating any state. Empty/null
+    // falls through to the legacy behavior (default to 0.0.0.0). A loopback selection is honored
+    // but logged as a warning — it defeats the point of distributed mode but isn't malformed.
+    var bindResult = BindInterfaceValidator.Validate(bindInterface);
+    if (!bindResult.IsEmpty && !bindResult.IsValid)
+    {
+        distLogger.LogWarning("Rejecting distributed enable: invalid bindInterface '{Bind}'", bindInterface);
+        return Results.BadRequest(new { error = bindResult.ErrorMessage });
+    }
+    string? requestedBind = bindResult.IsValid ? bindResult.NormalizedAddress : null;
+    if (bindResult.IsValid && bindResult.IsLoopback)
+    {
+        distLogger.LogWarning(
+            "Distributed mode enabled with loopback bindInterface {Bind} — remote ingestors will not be reachable",
+            requestedBind);
+    }
+
     var cfg = configStore.Load();
     var wasEnabled = cfg.Enabled;
+    var previousBind = cfg.BindAddress;
 
     cfg.Enabled = true;
-    if (string.IsNullOrWhiteSpace(cfg.BindAddress) || cfg.BindAddress == "127.0.0.1")
+    if (requestedBind != null)
+    {
+        cfg.BindAddress = requestedBind;
+    }
+    else if (string.IsNullOrWhiteSpace(cfg.BindAddress) || cfg.BindAddress == "127.0.0.1")
+    {
         cfg.BindAddress = "0.0.0.0";
+    }
 
     // Generate (or reuse) the cert so the fingerprint we return matches what Kestrel will
     // present after restart. SAN includes loopback + the bind interface (when not wildcard).
@@ -735,6 +761,7 @@ app.MapPost("/api/admin/distributed/enable", async (
         // Persisted state changes take effect on the next service start. The desktop wizard
         // is responsible for triggering the restart via the Tauri service control layer.
         RestartRequired = !wasEnabled
+            || !string.Equals(previousBind, cfg.BindAddress, StringComparison.OrdinalIgnoreCase)
     });
 }).RequireRateLimiting("general");
 
@@ -1189,16 +1216,43 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                         evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                     if (codeFileEvt != null)
                     {
-                        var project = await ResolveOrCreateProjectAsync(
-                            codeIndexRepo, projectIdResolver, hostIdProvider,
-                            codeFileEvt.RepositoryName, codeFileEvt.SourceType, codeFileEvt.SourcePath);
+                        // Phase 11: prefer the batch's ProjectId (the secondary's canonical project_id
+                        // resolved per design §2.2) when supplied. v2 secondaries always populate it
+                        // and that's the dedup invariant — same project_id from two hosts → same
+                        // projects row. v1 batches and the local single-machine ingestor still flow
+                        // through the name-based ResolveOrCreate path for backcompat.
+                        Project project;
+                        if (!string.IsNullOrEmpty(request.ProjectId))
+                        {
+                            var existingById = await codeIndexRepo.GetProjectAsync(request.ProjectId);
+                            project = existingById ?? await codeIndexRepo.UpsertProjectAsync(new Project
+                            {
+                                ProjectId = request.ProjectId,
+                                DisplayName = codeFileEvt.RepositoryName,
+                                IdentityKind = "git", // optimistic; overwritten on next git-aware ingest
+                                SourceType = codeFileEvt.SourceType,
+                                SourcePath = codeFileEvt.SourcePath
+                            });
+                        }
+                        else
+                        {
+                            project = await ResolveOrCreateProjectAsync(
+                                codeIndexRepo, projectIdResolver, hostIdProvider,
+                                codeFileEvt.RepositoryName, codeFileEvt.SourceType, codeFileEvt.SourcePath);
+                        }
 
-                        var localHostId = hostIdProvider.GetHostId();
+                        // Phase 11: file_locations are attributed to the *batch's* host_id, not the
+                        // primary's local host. v1 batches with no HostId still fall back to local.
+                        var attributionHostId = !string.IsNullOrEmpty(request.HostId)
+                            ? request.HostId
+                            : hostIdProvider.GetHostId();
+                        // RelPath is the v2 path field; FilePath is the v1 fallback (design §3.3).
+                        var relPath = !string.IsNullOrEmpty(codeFileEvt.RelPath) ? codeFileEvt.RelPath : codeFileEvt.FilePath;
                         await codeIndexRepo.UpsertFileAsync(
-                            localHostId, project.ProjectId, codeFileEvt.FilePath,
+                            attributionHostId, project.ProjectId, relPath,
                             codeFileEvt.Language, codeFileEvt.FileSize, codeFileEvt.ContentHash);
 
-                        await codeIndexRepo.UpdateProjectStatsAsync(project.ProjectId, localHostId);
+                        await codeIndexRepo.UpdateProjectStatsAsync(project.ProjectId, attributionHostId);
                     }
                     break;
 
@@ -1207,14 +1261,20 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                         evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                     if (codeDeleteEvt != null)
                     {
-                        var delProject = await codeIndexRepo.GetProjectByNameAsync(codeDeleteEvt.RepositoryName);
+                        // Prefer batch's ProjectId, fall back to the legacy name lookup for v1.
+                        Project? delProject = !string.IsNullOrEmpty(request.ProjectId)
+                            ? await codeIndexRepo.GetProjectAsync(request.ProjectId)
+                            : await codeIndexRepo.GetProjectByNameAsync(codeDeleteEvt.RepositoryName);
                         if (delProject != null)
                         {
-                            var localHostId = hostIdProvider.GetHostId();
+                            var attributionHostId = !string.IsNullOrEmpty(request.HostId)
+                                ? request.HostId
+                                : hostIdProvider.GetHostId();
+                            var relPath = !string.IsNullOrEmpty(codeDeleteEvt.RelPath) ? codeDeleteEvt.RelPath : codeDeleteEvt.FilePath;
                             var removed = await codeIndexRepo.DeleteFileAsync(
-                                localHostId, delProject.ProjectId, codeDeleteEvt.FilePath);
+                                attributionHostId, delProject.ProjectId, relPath);
                             if (removed)
-                                await codeIndexRepo.UpdateProjectStatsAsync(delProject.ProjectId, localHostId);
+                                await codeIndexRepo.UpdateProjectStatsAsync(delProject.ProjectId, attributionHostId);
                         }
                         // Missing project or missing file is not an error — the delete is idempotent.
                     }
@@ -1225,11 +1285,15 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                         evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                     if (symBatchEvt != null)
                     {
-                        var symProject = await codeIndexRepo.GetProjectByNameAsync(symBatchEvt.RepositoryName);
+                        Project? symProject = !string.IsNullOrEmpty(request.ProjectId)
+                            ? await codeIndexRepo.GetProjectAsync(request.ProjectId)
+                            : await codeIndexRepo.GetProjectByNameAsync(symBatchEvt.RepositoryName);
                         if (symProject != null)
                         {
-                            var localHostId = hostIdProvider.GetHostId();
-                            var locations = await codeIndexRepo.GetFileTreeAsync(symProject.ProjectId, localHostId);
+                            var attributionHostId = !string.IsNullOrEmpty(request.HostId)
+                                ? request.HostId
+                                : hostIdProvider.GetHostId();
+                            var locations = await codeIndexRepo.GetFileTreeAsync(symProject.ProjectId, attributionHostId);
                             var location = locations.FirstOrDefault(l => l.RelPath == symBatchEvt.FilePath);
                             if (location != null)
                             {
@@ -1249,7 +1313,7 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
 
                                 await codeIndexRepo.UpsertSymbolsAsync(
                                     location.ContentSha256, symProject.ProjectId, symbols);
-                                await codeIndexRepo.UpdateProjectStatsAsync(symProject.ProjectId, localHostId);
+                                await codeIndexRepo.UpdateProjectStatsAsync(symProject.ProjectId, attributionHostId);
                             }
                         }
                     }
@@ -1580,3 +1644,9 @@ public class SetupState
 {
     public bool IsSetupComplete { get; set; }
 }
+
+// Test hook: WebApplicationFactory<Program> needs a public Program type to bind to.
+// Top-level statements compile to an internal Program class; we expose it via a partial
+// declaration so the integration tests can host the API in-process. Adding members here
+// would change the program semantics — keep this empty.
+public partial class Program { }

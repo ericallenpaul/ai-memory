@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.3" />
     <PackageReference Include="Xunit.SkippableFact" Version="1.4.13" />
     <PackageReference Include="xunit" Version="2.9.3" />
@@ -17,7 +18,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\AIMemory.Api\AIMemory.Api.csproj" />
     <ProjectReference Include="..\..\src\AIMemory.CodeIndex\AIMemory.CodeIndex.csproj" />
+    <ProjectReference Include="..\..\src\AIMemory.Data\AIMemory.Data.csproj" />
+    <ProjectReference Include="..\..\src\AIMemory.Identity\AIMemory.Identity.csproj" />
     <ProjectReference Include="..\..\src\AIMemory.Ingestor\AIMemory.Ingestor.csproj" />
     <ProjectReference Include="..\..\src\AIMemory.Models\AIMemory.Models.csproj" />
     <ProjectReference Include="..\..\tests\AIMemory.Tests.Unit\AIMemory.Tests.Unit.csproj" />

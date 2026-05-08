@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "prepublish:dotnet": "node scripts/publish-dotnet.mjs",
+    "tauri:build": "npm run prepublish:dotnet && tauri build"
   },
   "dependencies": {
     "react": "^19.1.0",

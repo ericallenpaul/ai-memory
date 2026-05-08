@@ -78,9 +78,10 @@ pub fn status() -> Result<Value, DesktopError> {
 
 /// `POST /api/admin/distributed/enable` — flips the toggle on.
 ///
-/// The API endpoint accepts no body in phase 7a; the user's chosen `bind_interface` is sent
-/// as a query string for forward-compat with a future server side that honors it. The
-/// current API ignores the query and uses its own default; future phases can wire it up.
+/// The user's chosen `bind_interface` is sent as a query string. As of phase 11 the API
+/// honors and validates this parameter (rejecting non-IPs with 400, accepting `0.0.0.0`,
+/// loopback, or any IPv4); the persisted value is what Kestrel binds to on the next API
+/// service restart.
 pub fn enable(args: EnableArgs) -> Result<Value, DesktopError> {
     let path = match &args.bind_interface {
         Some(iface) if !iface.is_empty() => format!(

@@ -15,6 +15,8 @@ using AIMemory.Models.Events;
 using AIMemory.CodeIndex;
 using AIMemory.CodeIndex.Parsers;
 using AIMemory.CodeIndex.Security;
+using AIMemory.Data.Migrations;
+using AIMemory.Identity;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -150,6 +152,17 @@ builder.Services.AddScoped<IIngestionRepository, IngestionRepository>();
 builder.Services.AddScoped<IVectorRepository, VectorRepository>();
 builder.Services.AddScoped<ICodeIndexRepository, CodeIndexRepository>();
 builder.Services.AddScoped<IApiKeyRepository, ApiKeyRepository>();
+builder.Services.AddScoped<IHostRepository, HostRepository>();
+builder.Services.AddScoped<IProjectRepository, ProjectRepository>();
+builder.Services.AddScoped<IFileLocationRepository, FileLocationRepository>();
+builder.Services.AddScoped<IContentRepository, ContentRepository>();
+builder.Services.AddScoped<IPairingRepository, PairingRepository>();
+
+// Identity (host_id + project_id derivation, install salt)
+builder.Services.AddSingleton<IInstallSaltStore>(_ => InstallSaltStore.CreateDefault());
+builder.Services.AddSingleton<IHostIdProvider, HostIdProvider>();
+builder.Services.AddSingleton<IProjectIdResolver, ProjectIdResolver>();
+builder.Services.AddScoped<LegacyProjectMigrator>();
 
 // Code Index services
 builder.Services.AddSingleton<FileFilter>();
@@ -209,6 +222,10 @@ using (var scope = app.Services.CreateScope())
     {
         db.Database.Migrate();
         startupLogger.Info("Database migrations applied");
+
+        // Phase 6 post-migrate: canonicalize fallback project ids to git ids when possible.
+        var legacyMigrator = scope.ServiceProvider.GetRequiredService<LegacyProjectMigrator>();
+        await legacyMigrator.RunIfPendingAsync();
     }
     catch (Exception ex)
     {
@@ -371,41 +388,78 @@ app.MapGet("/api/admin/tables/{name}", async (string name, int? limit, int? offs
 
     switch (name)
     {
-        case "code_repositories":
-            columns = ["RepositoryId", "Name", "SourceType", "SourcePath", "FileCount", "SymbolCount", "IndexedAt", "UpdatedAt"];
-            total = await db.CodeRepositories.CountAsync();
-            rows = (await db.CodeRepositories
-                .OrderByDescending(r => r.UpdatedAt)
+        case "code_repositories":  // legacy alias — read from projects (the SQLite view also exposes this)
+        case "projects":
+            columns = ["ProjectId", "DisplayName", "IdentityKind", "SourceType", "SourcePath", "FileCount", "SymbolCount", "FirstSeenAt", "LastSeenAt"];
+            total = await db.Projects.CountAsync();
+            rows = (await db.Projects
+                .OrderByDescending(p => p.LastSeenAt)
                 .Skip(skip).Take(take)
                 .ToListAsync())
-                .Select(r => (object)new {
-                    r.RepositoryId, r.Name, r.SourceType, r.SourcePath,
-                    r.FileCount, r.SymbolCount, r.IndexedAt, r.UpdatedAt
+                .Select(p => (object)new {
+                    p.ProjectId, p.DisplayName, p.IdentityKind, p.SourceType, p.SourcePath,
+                    p.FileCount, p.SymbolCount, p.FirstSeenAt, p.LastSeenAt
                 }).ToArray();
             break;
 
         case "code_files":
-            columns = ["FileId", "RepositoryId", "FilePath", "Language", "FileSize", "ContentHash", "IndexedAt"];
+            columns = ["ContentSha256", "Language", "FileSize", "FirstSeenAt", "LastSeenAt"];
             total = await db.CodeFiles.CountAsync();
             rows = (await db.CodeFiles
-                .OrderBy(f => f.FilePath)
+                .OrderBy(f => f.ContentSha256)
                 .Skip(skip).Take(take)
                 .ToListAsync())
                 .Select(f => (object)new {
-                    f.FileId, f.RepositoryId, f.FilePath, f.Language,
-                    f.FileSize, f.ContentHash, f.IndexedAt
+                    f.ContentSha256, f.Language, f.FileSize, f.FirstSeenAt, f.LastSeenAt
+                }).ToArray();
+            break;
+
+        case "file_locations":
+            columns = ["HostId", "ProjectId", "RelPath", "ContentSha256", "Language", "FileSize", "FirstSeenAt", "LastSeenAt"];
+            total = await db.FileLocations.CountAsync();
+            rows = (await db.FileLocations
+                .OrderBy(l => l.ProjectId).ThenBy(l => l.RelPath)
+                .Skip(skip).Take(take)
+                .ToListAsync())
+                .Select(l => (object)new {
+                    l.HostId, l.ProjectId, l.RelPath, l.ContentSha256, l.Language, l.FileSize,
+                    l.FirstSeenAt, l.LastSeenAt
+                }).ToArray();
+            break;
+
+        case "hosts":
+            columns = ["HostId", "FriendlyName", "OsKind", "IsLocal", "FirstSeenAt", "LastSeenAt"];
+            total = await db.Hosts.CountAsync();
+            rows = (await db.Hosts
+                .OrderByDescending(h => h.LastSeenAt)
+                .Skip(skip).Take(take)
+                .ToListAsync())
+                .Select(h => (object)new {
+                    h.HostId, h.FriendlyName, h.OsKind, h.IsLocal, h.FirstSeenAt, h.LastSeenAt
+                }).ToArray();
+            break;
+
+        case "pairings":
+            columns = ["PairingId", "HostId", "FriendlyName", "PairedAt", "LastContactAt", "IsRevoked"];
+            total = await db.Pairings.CountAsync();
+            rows = (await db.Pairings
+                .OrderByDescending(p => p.PairedAt)
+                .Skip(skip).Take(take)
+                .ToListAsync())
+                .Select(p => (object)new {
+                    p.PairingId, p.HostId, p.FriendlyName, p.PairedAt, p.LastContactAt, p.IsRevoked
                 }).ToArray();
             break;
 
         case "code_symbols":
-            columns = ["SymbolId", "RepositoryId", "SymbolKey", "Name", "QualifiedName", "Kind", "StartLine", "EndLine"];
+            columns = ["SymbolId", "ProjectId", "ContentSha256", "SymbolKey", "Name", "QualifiedName", "Kind", "StartLine", "EndLine"];
             total = await db.CodeSymbols.CountAsync();
             rows = (await db.CodeSymbols
                 .OrderBy(s => s.QualifiedName)
                 .Skip(skip).Take(take)
                 .ToListAsync())
                 .Select(s => (object)new {
-                    s.SymbolId, s.RepositoryId, s.SymbolKey, s.Name,
+                    s.SymbolId, s.ProjectId, s.ContentSha256, s.SymbolKey, s.Name,
                     s.QualifiedName, s.Kind, s.StartLine, s.EndLine
                 }).ToArray();
             break;
@@ -723,6 +777,7 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
     ISessionRepository sessionRepo, IMessageRepository messageRepo,
     IToolCallRepository toolCallRepo, IArtifactRepository artifactRepo,
     IIngestionRepository ingestionRepo, ICodeIndexRepository codeIndexRepo,
+    IHostIdProvider hostIdProvider, IProjectIdResolver projectIdResolver,
     ILoggerFactory loggerFactory) =>
 {
     var batchLogger = loggerFactory.CreateLogger("AIMemory.Api.Ingest");
@@ -844,30 +899,16 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                         evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                     if (codeFileEvt != null)
                     {
-                        var repo = await codeIndexRepo.GetRepositoryByNameAsync(codeFileEvt.RepositoryName);
-                        if (repo == null)
-                        {
-                            repo = await codeIndexRepo.UpsertRepositoryAsync(new CodeRepository
-                            {
-                                Name = codeFileEvt.RepositoryName,
-                                SourceType = codeFileEvt.SourceType,
-                                SourcePath = codeFileEvt.SourcePath,
-                                IndexedAt = DateTimeOffset.UtcNow,
-                                UpdatedAt = DateTimeOffset.UtcNow
-                            });
-                        }
+                        var project = await ResolveOrCreateProjectAsync(
+                            codeIndexRepo, projectIdResolver, hostIdProvider,
+                            codeFileEvt.RepositoryName, codeFileEvt.SourceType, codeFileEvt.SourcePath);
 
-                        await codeIndexRepo.UpsertFileAsync(new CodeFile
-                        {
-                            RepositoryId = repo.RepositoryId,
-                            FilePath = codeFileEvt.FilePath,
-                            Language = codeFileEvt.Language,
-                            FileSize = codeFileEvt.FileSize,
-                            ContentHash = codeFileEvt.ContentHash,
-                            IndexedAt = DateTimeOffset.UtcNow
-                        });
+                        var localHostId = hostIdProvider.GetHostId();
+                        await codeIndexRepo.UpsertFileAsync(
+                            localHostId, project.ProjectId, codeFileEvt.FilePath,
+                            codeFileEvt.Language, codeFileEvt.FileSize, codeFileEvt.ContentHash);
 
-                        await codeIndexRepo.UpdateRepositoryStatsAsync(repo.RepositoryId);
+                        await codeIndexRepo.UpdateProjectStatsAsync(project.ProjectId, localHostId);
                     }
                     break;
 
@@ -876,14 +917,16 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                         evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                     if (codeDeleteEvt != null)
                     {
-                        var delRepo = await codeIndexRepo.GetRepositoryByNameAsync(codeDeleteEvt.RepositoryName);
-                        if (delRepo != null)
+                        var delProject = await codeIndexRepo.GetProjectByNameAsync(codeDeleteEvt.RepositoryName);
+                        if (delProject != null)
                         {
-                            var removed = await codeIndexRepo.DeleteFileAsync(delRepo.RepositoryId, codeDeleteEvt.FilePath);
+                            var localHostId = hostIdProvider.GetHostId();
+                            var removed = await codeIndexRepo.DeleteFileAsync(
+                                localHostId, delProject.ProjectId, codeDeleteEvt.FilePath);
                             if (removed)
-                                await codeIndexRepo.UpdateRepositoryStatsAsync(delRepo.RepositoryId);
+                                await codeIndexRepo.UpdateProjectStatsAsync(delProject.ProjectId, localHostId);
                         }
-                        // Missing repo or missing file is not an error — the delete is idempotent.
+                        // Missing project or missing file is not an error — the delete is idempotent.
                     }
                     break;
 
@@ -892,17 +935,16 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                         evt.Payload.GetRawText(), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                     if (symBatchEvt != null)
                     {
-                        var symRepo = await codeIndexRepo.GetRepositoryByNameAsync(symBatchEvt.RepositoryName);
-                        if (symRepo != null)
+                        var symProject = await codeIndexRepo.GetProjectByNameAsync(symBatchEvt.RepositoryName);
+                        if (symProject != null)
                         {
-                            var files = await codeIndexRepo.GetFileTreeAsync(symRepo.RepositoryId);
-                            var file = files.FirstOrDefault(f => f.FilePath == symBatchEvt.FilePath);
-                            if (file != null)
+                            var localHostId = hostIdProvider.GetHostId();
+                            var locations = await codeIndexRepo.GetFileTreeAsync(symProject.ProjectId, localHostId);
+                            var location = locations.FirstOrDefault(l => l.RelPath == symBatchEvt.FilePath);
+                            if (location != null)
                             {
                                 var symbols = symBatchEvt.Symbols.Select(s => new CodeSymbol
                                 {
-                                    FileId = file.FileId,
-                                    RepositoryId = symRepo.RepositoryId,
                                     SymbolKey = s.SymbolKey,
                                     Name = s.Name,
                                     QualifiedName = s.QualifiedName,
@@ -912,12 +954,12 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
                                     EndLine = s.EndLine,
                                     StartByte = s.StartByte,
                                     EndByte = s.EndByte,
-                                    ParentSymbolKey = s.ParentSymbolKey,
-                                    IndexedAt = DateTimeOffset.UtcNow
+                                    ParentSymbolKey = s.ParentSymbolKey
                                 }).ToList();
 
-                                await codeIndexRepo.UpsertSymbolsAsync(file.FileId, symRepo.RepositoryId, symbols);
-                                await codeIndexRepo.UpdateRepositoryStatsAsync(symRepo.RepositoryId);
+                                await codeIndexRepo.UpsertSymbolsAsync(
+                                    location.ContentSha256, symProject.ProjectId, symbols);
+                                await codeIndexRepo.UpdateProjectStatsAsync(symProject.ProjectId, localHostId);
                             }
                         }
                     }
@@ -978,24 +1020,29 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
 }).RequireRateLimiting("general");
 
 // ==================== Code Index Endpoints ====================
+//
+// Phase 6: route parameter is a project_id (64-char lowercase hex SHA-256), not a Guid.
+// Path shapes are unchanged so MCP clients keep working — only the id format changed.
+
+static CodeRepoResponse ToRepoResponse(Project p) => new()
+{
+    ProjectId = p.ProjectId,
+    Name = p.DisplayName,
+    SourceType = p.SourceType,
+    SourcePath = p.SourcePath,
+    FileCount = p.FileCount,
+    SymbolCount = p.SymbolCount,
+    IndexedAt = p.FirstSeenAt,
+    UpdatedAt = p.LastSeenAt
+};
 
 app.MapPost("/api/code/index-folder", async (IndexFolderRequest request, CodeIndexingService indexer) =>
 {
     if (string.IsNullOrWhiteSpace(request.FolderPath))
         return Results.BadRequest(new { error = "FolderPath is required" });
 
-    var repo = await indexer.IndexLocalFolderAsync(request.FolderPath, request.Name);
-    return Results.Ok(new CodeRepoResponse
-    {
-        RepositoryId = repo.RepositoryId,
-        Name = repo.Name,
-        SourceType = repo.SourceType,
-        SourcePath = repo.SourcePath,
-        FileCount = repo.FileCount,
-        SymbolCount = repo.SymbolCount,
-        IndexedAt = repo.IndexedAt,
-        UpdatedAt = repo.UpdatedAt
-    });
+    var project = await indexer.IndexLocalFolderAsync(request.FolderPath, request.Name);
+    return Results.Ok(ToRepoResponse(project));
 }).RequireRateLimiting("general");
 
 app.MapGet("/api/code/repos", async (CodeQueryService query) =>
@@ -1004,54 +1051,33 @@ app.MapGet("/api/code/repos", async (CodeQueryService query) =>
     return Results.Ok(repos);
 }).RequireRateLimiting("general");
 
-app.MapGet("/api/code/repos/{repoId:guid}", async (Guid repoId, ICodeIndexRepository codeRepo) =>
+app.MapGet("/api/code/repos/{repoId}", async (string repoId, ICodeIndexRepository codeRepo) =>
 {
-    var repo = await codeRepo.GetRepositoryAsync(repoId);
-    if (repo == null) return Results.NotFound(new { error = "Repository not found" });
-
-    return Results.Ok(new CodeRepoResponse
-    {
-        RepositoryId = repo.RepositoryId,
-        Name = repo.Name,
-        SourceType = repo.SourceType,
-        SourcePath = repo.SourcePath,
-        FileCount = repo.FileCount,
-        SymbolCount = repo.SymbolCount,
-        IndexedAt = repo.IndexedAt,
-        UpdatedAt = repo.UpdatedAt
-    });
+    var project = await codeRepo.GetProjectAsync(repoId);
+    if (project == null) return Results.NotFound(new { error = "Repository not found" });
+    return Results.Ok(ToRepoResponse(project));
 }).RequireRateLimiting("general");
 
-app.MapDelete("/api/code/repos/{repoId:guid}", async (Guid repoId, ICodeIndexRepository codeRepo) =>
+app.MapDelete("/api/code/repos/{repoId}", async (string repoId, ICodeIndexRepository codeRepo) =>
 {
-    await codeRepo.DeleteRepositoryAsync(repoId);
+    await codeRepo.DeleteProjectAsync(repoId);
     return Results.Ok(new { message = "Repository deleted" });
 }).RequireRateLimiting("general");
 
-app.MapPost("/api/code/repos/{repoId:guid}/reindex", async (Guid repoId, CodeIndexingService indexer) =>
+app.MapPost("/api/code/repos/{repoId}/reindex", async (string repoId, CodeIndexingService indexer) =>
 {
-    var repo = await indexer.ReindexAsync(repoId);
-    return Results.Ok(new CodeRepoResponse
-    {
-        RepositoryId = repo.RepositoryId,
-        Name = repo.Name,
-        SourceType = repo.SourceType,
-        SourcePath = repo.SourcePath,
-        FileCount = repo.FileCount,
-        SymbolCount = repo.SymbolCount,
-        IndexedAt = repo.IndexedAt,
-        UpdatedAt = repo.UpdatedAt
-    });
+    var project = await indexer.ReindexAsync(repoId);
+    return Results.Ok(ToRepoResponse(project));
 }).RequireRateLimiting("general");
 
-app.MapGet("/api/code/repos/{repoId:guid}/tree", async (Guid repoId, CodeQueryService query) =>
+app.MapGet("/api/code/repos/{repoId}/tree", async (string repoId, CodeQueryService query) =>
 {
     var tree = await query.GetFileTreeAsync(repoId);
     if (tree == null) return Results.NotFound(new { error = "Repository not found" });
     return Results.Ok(tree);
 }).RequireRateLimiting("general");
 
-app.MapGet("/api/code/repos/{repoId:guid}/outline", async (Guid repoId, string? file, CodeQueryService query) =>
+app.MapGet("/api/code/repos/{repoId}/outline", async (string repoId, string? file, CodeQueryService query) =>
 {
     if (!string.IsNullOrEmpty(file))
     {
@@ -1065,7 +1091,7 @@ app.MapGet("/api/code/repos/{repoId:guid}/outline", async (Guid repoId, string? 
     return Results.Ok(repoOutline);
 }).RequireRateLimiting("general");
 
-app.MapGet("/api/code/repos/{repoId:guid}/symbol", async (Guid repoId, string key, CodeQueryService query) =>
+app.MapGet("/api/code/repos/{repoId}/symbol", async (string repoId, string key, CodeQueryService query) =>
 {
     if (string.IsNullOrWhiteSpace(key))
         return Results.BadRequest(new { error = "Symbol key is required" });
@@ -1075,13 +1101,13 @@ app.MapGet("/api/code/repos/{repoId:guid}/symbol", async (Guid repoId, string ke
     return Results.Ok(symbol);
 }).RequireRateLimiting("general");
 
-app.MapPost("/api/code/repos/{repoId:guid}/symbols", async (Guid repoId, List<string> symbolKeys, CodeQueryService query) =>
+app.MapPost("/api/code/repos/{repoId}/symbols", async (string repoId, List<string> symbolKeys, CodeQueryService query) =>
 {
     var symbols = await query.GetSymbolsAsync(repoId, symbolKeys);
     return Results.Ok(symbols);
 }).RequireRateLimiting("general");
 
-app.MapGet("/api/code/search/symbols", async (string q, Guid? repo, string? kind, int? limit, CodeQueryService query) =>
+app.MapGet("/api/code/search/symbols", async (string q, string? repo, string? kind, int? limit, CodeQueryService query) =>
 {
     if (string.IsNullOrWhiteSpace(q))
         return Results.BadRequest(new { error = "Query parameter 'q' is required" });
@@ -1090,7 +1116,7 @@ app.MapGet("/api/code/search/symbols", async (string q, Guid? repo, string? kind
     return Results.Ok(results);
 }).RequireRateLimiting("search");
 
-app.MapGet("/api/code/search/text", async (string q, Guid? repo, string? file, int? limit, CodeQueryService query) =>
+app.MapGet("/api/code/search/text", async (string q, string? repo, string? file, int? limit, CodeQueryService query) =>
 {
     if (string.IsNullOrWhiteSpace(q))
         return Results.BadRequest(new { error = "Query parameter 'q' is required" });
@@ -1225,6 +1251,37 @@ static async Task<int> GetMessageCount(IMessageRepository repo, Guid sessionId)
 {
     var messages = await repo.GetBySessionAsync(sessionId, 10000);
     return messages.Count;
+}
+
+/// <summary>
+/// Looks up an existing project by display name, or creates a fresh one with project_id
+/// derived from the source path via <see cref="IProjectIdResolver"/>. Used by the legacy
+/// ingest path (which carries display name + source path, not project_id).
+/// </summary>
+static async Task<Project> ResolveOrCreateProjectAsync(
+    ICodeIndexRepository repo,
+    IProjectIdResolver resolver,
+    IHostIdProvider hostIds,
+    string displayName,
+    string sourceType,
+    string sourcePath)
+{
+    var existing = await repo.GetProjectByNameAsync(displayName);
+    if (existing != null) return existing;
+
+    var hostId = hostIds.GetHostId();
+    var identity = resolver.Resolve(sourcePath, hostId);
+
+    return await repo.UpsertProjectAsync(new Project
+    {
+        ProjectId = identity.ProjectId,
+        DisplayName = displayName,
+        CanonicalRemoteUrl = identity.CanonicalRemoteUrl,
+        RootCommitSha = identity.RootCommitSha,
+        IdentityKind = identity.IdentityKind,
+        SourceType = sourceType,
+        SourcePath = sourcePath
+    });
 }
 
 // ==================== Setup State ====================

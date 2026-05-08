@@ -4,67 +4,84 @@ using Microsoft.Extensions.Logging;
 using AIMemory.CodeIndex.Parsers;
 using AIMemory.CodeIndex.Security;
 using AIMemory.Data.Repositories;
+using AIMemory.Identity;
 using AIMemory.Models.Entities;
 
 namespace AIMemory.CodeIndex;
 
+/// <summary>
+/// Indexes a local folder into the code index. Post-phase-6 this writes to the new
+/// project + file_location + content-addressed code_files schema.
+/// </summary>
 public class CodeIndexingService
 {
     private readonly ICodeIndexRepository _repo;
     private readonly ParserRegistry _parsers;
     private readonly FileFilter _fileFilter;
+    private readonly IProjectIdResolver _projectIds;
+    private readonly IHostIdProvider _hostIds;
     private readonly ILogger<CodeIndexingService> _logger;
 
     public CodeIndexingService(
         ICodeIndexRepository repo,
         ParserRegistry parsers,
         FileFilter fileFilter,
+        IProjectIdResolver projectIds,
+        IHostIdProvider hostIds,
         ILogger<CodeIndexingService> logger)
     {
         _repo = repo;
         _parsers = parsers;
         _fileFilter = fileFilter;
+        _projectIds = projectIds;
+        _hostIds = hostIds;
         _logger = logger;
     }
 
-    public async Task<CodeRepository> IndexLocalFolderAsync(string path, string? name, CancellationToken ct = default)
+    public async Task<Project> IndexLocalFolderAsync(string path, string? name, CancellationToken ct = default)
     {
         var fullPath = Path.GetFullPath(path);
         if (!Directory.Exists(fullPath))
             throw new DirectoryNotFoundException($"Directory not found: {fullPath}");
 
-        var repoName = name ?? Path.GetFileName(fullPath);
+        var hostId = _hostIds.GetHostId();
+        var identity = _projectIds.Resolve(fullPath, hostId);
+        var displayName = name ?? Path.GetFileName(fullPath);
 
-        var codeRepo = await _repo.UpsertRepositoryAsync(new CodeRepository
+        var project = await _repo.UpsertProjectAsync(new Project
         {
-            Name = repoName,
+            ProjectId = identity.ProjectId,
+            DisplayName = displayName,
+            CanonicalRemoteUrl = identity.CanonicalRemoteUrl,
+            RootCommitSha = identity.RootCommitSha,
+            IdentityKind = identity.IdentityKind,
             SourceType = "local",
             SourcePath = fullPath
         });
 
-        _logger.LogInformation("Indexing local folder: {Path} as {Name}", fullPath, repoName);
+        _logger.LogInformation("Indexing local folder: {Path} as {Name} (project_id={Id}, kind={Kind})",
+            fullPath, displayName, identity.ProjectId, identity.IdentityKind);
 
-        await IndexDirectoryAsync(codeRepo, fullPath, ct);
-
-        return codeRepo;
+        await IndexDirectoryAsync(project, hostId, fullPath, ct);
+        return project;
     }
 
-    public async Task<CodeRepository> ReindexAsync(Guid repositoryId, CancellationToken ct = default)
+    public async Task<Project> ReindexAsync(string projectId, CancellationToken ct = default)
     {
-        var codeRepo = await _repo.GetRepositoryAsync(repositoryId)
-            ?? throw new InvalidOperationException($"Repository {repositoryId} not found");
+        var project = await _repo.GetProjectAsync(projectId)
+            ?? throw new InvalidOperationException($"Project {projectId} not found");
 
-        if (!Directory.Exists(codeRepo.SourcePath))
-            throw new DirectoryNotFoundException($"Source path no longer exists: {codeRepo.SourcePath}");
+        if (!Directory.Exists(project.SourcePath))
+            throw new DirectoryNotFoundException($"Source path no longer exists: {project.SourcePath}");
 
-        _logger.LogInformation("Re-indexing repository: {Name}", codeRepo.Name);
+        _logger.LogInformation("Re-indexing project: {Name}", project.DisplayName);
 
-        await IndexDirectoryAsync(codeRepo, codeRepo.SourcePath, ct);
-
-        return codeRepo;
+        var hostId = _hostIds.GetHostId();
+        await IndexDirectoryAsync(project, hostId, project.SourcePath, ct);
+        return project;
     }
 
-    private async Task IndexDirectoryAsync(CodeRepository codeRepo, string rootPath, CancellationToken ct)
+    private async Task IndexDirectoryAsync(Project project, string hostId, string rootPath, CancellationToken ct)
     {
         var files = _fileFilter.EnumerateFiles(rootPath)
             .Where(f => _parsers.IsSupported(f) && !_fileFilter.IsBinaryFile(f))
@@ -87,26 +104,19 @@ public class CodeIndexingService
                 var content = await File.ReadAllTextAsync(filePath, ct);
                 var contentHash = ComputeHash(content);
                 var fileInfo = new FileInfo(filePath);
+                var language = _parsers.GetLanguage(filePath);
 
-                var codeFile = new CodeFile
-                {
-                    RepositoryId = codeRepo.RepositoryId,
-                    FilePath = relativePath,
-                    Language = _parsers.GetLanguage(filePath),
-                    FileSize = fileInfo.Length,
-                    ContentHash = contentHash
-                };
+                await _repo.UpsertFileAsync(
+                    hostId, project.ProjectId, relativePath, language, fileInfo.Length, contentHash);
 
-                await _repo.UpsertFileAsync(codeFile);
-
-                // Parse symbols
                 var parser = _parsers.GetParser(filePath);
                 if (parser != null)
                 {
                     var parsed = parser.Parse(relativePath, content);
                     var symbols = parsed.Select(p => new CodeSymbol
                     {
-                        SymbolKey = $"{relativePath}::{p.QualifiedName}#{p.Kind}",
+                        // Phase 6 symbol_key format: project_id::QualifiedName#kind.
+                        SymbolKey = $"{project.ProjectId}::{p.QualifiedName}#{p.Kind}",
                         Name = p.Name,
                         QualifiedName = p.QualifiedName,
                         Kind = p.Kind,
@@ -116,11 +126,11 @@ public class CodeIndexingService
                         StartByte = p.StartByte,
                         EndByte = p.EndByte,
                         ParentSymbolKey = p.ParentName != null
-                            ? $"{relativePath}::{p.ParentName}#{GetParentKind(parsed, p.ParentName)}"
+                            ? $"{project.ProjectId}::{p.ParentName}#{GetParentKind(parsed, p.ParentName)}"
                             : null
                     }).ToList();
 
-                    await _repo.UpsertSymbolsAsync(codeFile.FileId, codeRepo.RepositoryId, symbols);
+                    await _repo.UpsertSymbolsAsync(contentHash, project.ProjectId, symbols);
                     totalSymbols += symbols.Count;
 
                     _logger.LogDebug("Indexed {SymbolCount} symbols from {File}", symbols.Count, relativePath);
@@ -132,11 +142,9 @@ public class CodeIndexingService
             }
         }
 
-        // Clean up files that no longer exist
-        await _repo.DeleteStaleFilesAsync(codeRepo.RepositoryId, indexedPaths);
-
-        // Update stats
-        await _repo.UpdateRepositoryStatsAsync(codeRepo.RepositoryId);
+        // Clean up locations that no longer exist on this host.
+        await _repo.DeleteStaleFilesAsync(hostId, project.ProjectId, indexedPaths);
+        await _repo.UpdateProjectStatsAsync(project.ProjectId, hostId);
 
         _logger.LogInformation("Indexing complete: {FileCount} files, {SymbolCount} symbols",
             indexedPaths.Count, totalSymbols);

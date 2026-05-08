@@ -3,6 +3,9 @@ using AIMemory.Models.Entities;
 
 namespace AIMemory.Data.Repositories;
 
+/// <summary>
+/// Phase-6 content-addressed implementation of <see cref="ICodeIndexRepository"/>.
+/// </summary>
 public class CodeIndexRepository : ICodeIndexRepository
 {
     private readonly AIMemoryDbContext _db;
@@ -12,124 +15,199 @@ public class CodeIndexRepository : ICodeIndexRepository
         _db = db;
     }
 
-    public async Task<CodeRepository> UpsertRepositoryAsync(CodeRepository repo)
+    // ---------- Projects ----------
+
+    public async Task<Project> UpsertProjectAsync(Project project)
     {
-        var existing = await _db.CodeRepositories.FirstOrDefaultAsync(r => r.Name == repo.Name);
+        if (string.IsNullOrEmpty(project.ProjectId))
+            throw new ArgumentException("ProjectId must be set before upsert", nameof(project));
+
+        var now = DateTimeOffset.UtcNow;
+        var existing = await _db.Projects.FirstOrDefaultAsync(p => p.ProjectId == project.ProjectId);
         if (existing != null)
         {
-            existing.SourceType = repo.SourceType;
-            existing.SourcePath = repo.SourcePath;
-            existing.DefaultBranch = repo.DefaultBranch;
-            existing.UpdatedAt = DateTimeOffset.UtcNow;
+            existing.DisplayName = project.DisplayName;
+            existing.CanonicalRemoteUrl = project.CanonicalRemoteUrl ?? existing.CanonicalRemoteUrl;
+            existing.RootCommitSha = project.RootCommitSha ?? existing.RootCommitSha;
+            existing.IdentityKind = project.IdentityKind;
+            existing.SourceType = project.SourceType;
+            existing.SourcePath = project.SourcePath;
+            existing.DefaultBranch = project.DefaultBranch ?? existing.DefaultBranch;
+            existing.LastSeenAt = now;
         }
         else
         {
-            repo.RepositoryId = Guid.NewGuid();
-            repo.IndexedAt = DateTimeOffset.UtcNow;
-            repo.UpdatedAt = DateTimeOffset.UtcNow;
-            _db.CodeRepositories.Add(repo);
-            existing = repo;
+            project.FirstSeenAt = now;
+            project.LastSeenAt = now;
+            _db.Projects.Add(project);
+            existing = project;
         }
 
         await _db.SaveChangesAsync();
         return existing;
     }
 
-    public async Task<CodeRepository?> GetRepositoryAsync(Guid id)
-    {
-        return await _db.CodeRepositories.FirstOrDefaultAsync(r => r.RepositoryId == id);
-    }
+    public Task<Project?> GetProjectAsync(string projectId)
+        => _db.Projects.FirstOrDefaultAsync(p => p.ProjectId == projectId);
 
-    public async Task<CodeRepository?> GetRepositoryByNameAsync(string name)
-    {
-        return await _db.CodeRepositories.FirstOrDefaultAsync(r => r.Name == name);
-    }
+    public Task<Project?> GetProjectByNameAsync(string displayName)
+        => _db.Projects.FirstOrDefaultAsync(p => p.DisplayName == displayName);
 
-    public async Task<List<CodeRepository>> ListRepositoriesAsync()
-    {
-        return await _db.CodeRepositories.OrderByDescending(r => r.UpdatedAt).ToListAsync();
-    }
+    public Task<List<Project>> ListProjectsAsync()
+        => _db.Projects.OrderByDescending(p => p.LastSeenAt).ToListAsync();
 
-    public async Task DeleteRepositoryAsync(Guid id)
+    public async Task DeleteProjectAsync(string projectId)
     {
-        var symbols = _db.CodeSymbols.Where(s => s.RepositoryId == id);
+        // Symbols are project-scoped — drop them first.
+        var symbols = _db.CodeSymbols.Where(s => s.ProjectId == projectId);
         _db.CodeSymbols.RemoveRange(symbols);
 
-        var files = _db.CodeFiles.Where(f => f.RepositoryId == id);
-        _db.CodeFiles.RemoveRange(files);
+        // file_locations are project-scoped (across all hosts).
+        var locations = await _db.FileLocations.Where(l => l.ProjectId == projectId).ToListAsync();
+        _db.FileLocations.RemoveRange(locations);
 
-        var repo = await _db.CodeRepositories.FindAsync(id);
-        if (repo != null)
-            _db.CodeRepositories.Remove(repo);
+        var project = await _db.Projects.FirstOrDefaultAsync(p => p.ProjectId == projectId);
+        if (project != null)
+            _db.Projects.Remove(project);
 
+        await _db.SaveChangesAsync();
+
+        // GC orphan content blobs that no other project references.
+        var orphanHashes = locations.Select(l => l.ContentSha256).Distinct().ToList();
+        await DeleteOrphanContentAsync(orphanHashes);
+    }
+
+    public async Task UpdateProjectStatsAsync(string projectId, string localHostId)
+    {
+        var project = await _db.Projects.FirstOrDefaultAsync(p => p.ProjectId == projectId);
+        if (project == null) return;
+
+        project.FileCount = await _db.FileLocations
+            .CountAsync(l => l.ProjectId == projectId && l.HostId == localHostId);
+        project.SymbolCount = await _db.CodeSymbols.CountAsync(s => s.ProjectId == projectId);
+        project.LastSeenAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync();
     }
 
-    public async Task UpsertFileAsync(CodeFile file)
-    {
-        var existing = await _db.CodeFiles
-            .FirstOrDefaultAsync(f => f.RepositoryId == file.RepositoryId && f.FilePath == file.FilePath);
+    // ---------- Files ----------
 
-        if (existing != null)
+    public async Task UpsertFileAsync(string hostId, string projectId, string relPath, string language,
+        long fileSize, string contentSha256)
+    {
+        if (string.IsNullOrEmpty(contentSha256))
+            throw new ArgumentException("contentSha256 must be set", nameof(contentSha256));
+
+        var now = DateTimeOffset.UtcNow;
+
+        // 1. Content blob (shared across hosts).
+        var content = await _db.CodeFiles.FirstOrDefaultAsync(f => f.ContentSha256 == contentSha256);
+        if (content == null)
         {
-            existing.Language = file.Language;
-            existing.FileSize = file.FileSize;
-            existing.ContentHash = file.ContentHash;
-            existing.IndexedAt = DateTimeOffset.UtcNow;
-            file.FileId = existing.FileId;
+            _db.CodeFiles.Add(new CodeFile
+            {
+                ContentSha256 = contentSha256,
+                Language = language,
+                FileSize = fileSize,
+                FirstSeenAt = now,
+                LastSeenAt = now
+            });
         }
         else
         {
-            file.FileId = Guid.NewGuid();
-            file.IndexedAt = DateTimeOffset.UtcNow;
-            _db.CodeFiles.Add(file);
+            content.LastSeenAt = now;
+        }
+
+        // 2. Per-host location.
+        var location = await _db.FileLocations.FirstOrDefaultAsync(l =>
+            l.HostId == hostId && l.ProjectId == projectId && l.RelPath == relPath);
+
+        string? oldContent = null;
+        if (location == null)
+        {
+            _db.FileLocations.Add(new FileLocation
+            {
+                HostId = hostId,
+                ProjectId = projectId,
+                RelPath = relPath,
+                ContentSha256 = contentSha256,
+                Language = language,
+                FileSize = fileSize,
+                FirstSeenAt = now,
+                LastSeenAt = now
+            });
+        }
+        else
+        {
+            if (location.ContentSha256 != contentSha256)
+                oldContent = location.ContentSha256;
+            location.ContentSha256 = contentSha256;
+            location.Language = language;
+            location.FileSize = fileSize;
+            location.LastSeenAt = now;
         }
 
         await _db.SaveChangesAsync();
+
+        // 3. GC the previously-pointed-to blob if no one references it now.
+        if (oldContent != null)
+            await DeleteOrphanContentAsync(new[] { oldContent });
     }
 
-    public async Task DeleteStaleFilesAsync(Guid repositoryId, IEnumerable<string> currentFilePaths)
+    public async Task DeleteStaleFilesAsync(string hostId, string projectId, IEnumerable<string> currentRelPaths)
     {
-        var pathSet = currentFilePaths.ToHashSet();
-        var staleFiles = await _db.CodeFiles
-            .Where(f => f.RepositoryId == repositoryId)
+        var pathSet = currentRelPaths.ToHashSet();
+        var staleLocations = await _db.FileLocations
+            .Where(l => l.HostId == hostId && l.ProjectId == projectId)
             .ToListAsync();
 
-        var toRemove = staleFiles.Where(f => !pathSet.Contains(f.FilePath)).ToList();
+        var toRemove = staleLocations.Where(l => !pathSet.Contains(l.RelPath)).ToList();
         if (toRemove.Count == 0) return;
 
-        var staleFileIds = toRemove.Select(f => f.FileId).ToHashSet();
-        var staleSymbols = _db.CodeSymbols.Where(s => staleFileIds.Contains(s.FileId));
-        _db.CodeSymbols.RemoveRange(staleSymbols);
-        _db.CodeFiles.RemoveRange(toRemove);
+        var orphanCandidates = toRemove.Select(l => l.ContentSha256).Distinct().ToList();
+        _db.FileLocations.RemoveRange(toRemove);
         await _db.SaveChangesAsync();
+
+        await DeleteOrphanContentAsync(orphanCandidates);
     }
 
-    public async Task<bool> DeleteFileAsync(Guid repositoryId, string filePath)
+    public async Task<bool> DeleteFileAsync(string hostId, string projectId, string relPath)
     {
-        var file = await _db.CodeFiles
-            .FirstOrDefaultAsync(f => f.RepositoryId == repositoryId && f.FilePath == filePath);
+        var location = await _db.FileLocations.FirstOrDefaultAsync(l =>
+            l.HostId == hostId && l.ProjectId == projectId && l.RelPath == relPath);
+        if (location == null) return false;
 
-        if (file == null) return false;
-
-        var symbols = _db.CodeSymbols.Where(s => s.FileId == file.FileId);
-        _db.CodeSymbols.RemoveRange(symbols);
-        _db.CodeFiles.Remove(file);
+        var contentHash = location.ContentSha256;
+        _db.FileLocations.Remove(location);
         await _db.SaveChangesAsync();
+
+        await DeleteOrphanContentAsync(new[] { contentHash });
         return true;
     }
 
-    public async Task UpsertSymbolsAsync(Guid fileId, Guid repositoryId, List<CodeSymbol> symbols)
+    public Task<List<FileLocation>> GetFileTreeAsync(string projectId, string hostId)
     {
-        // Remove existing symbols for this file
-        var existing = _db.CodeSymbols.Where(s => s.FileId == fileId);
+        return _db.FileLocations
+            .Where(l => l.ProjectId == projectId && l.HostId == hostId)
+            .OrderBy(l => l.RelPath)
+            .ToListAsync();
+    }
+
+    // ---------- Symbols ----------
+
+    public async Task UpsertSymbolsAsync(string contentSha256, string projectId, List<CodeSymbol> symbols)
+    {
+        // Replace symbols for this content blob within this project. (A symbol's identity is
+        // content + project — re-keying ensures the per-project symbol_key stays stable when
+        // the same content is also indexed under a different project.)
+        var existing = _db.CodeSymbols
+            .Where(s => s.ContentSha256 == contentSha256 && s.ProjectId == projectId);
         _db.CodeSymbols.RemoveRange(existing);
 
         foreach (var symbol in symbols)
         {
             symbol.SymbolId = Guid.NewGuid();
-            symbol.FileId = fileId;
-            symbol.RepositoryId = repositoryId;
+            symbol.ContentSha256 = contentSha256;
+            symbol.ProjectId = projectId;
             symbol.IndexedAt = DateTimeOffset.UtcNow;
         }
 
@@ -137,65 +215,84 @@ public class CodeIndexRepository : ICodeIndexRepository
         await _db.SaveChangesAsync();
     }
 
-    public async Task<List<CodeFile>> GetFileTreeAsync(Guid repositoryId)
+    public async Task<List<CodeSymbol>> GetFileOutlineAsync(string projectId, string hostId, string relPath)
     {
-        return await _db.CodeFiles
-            .Where(f => f.RepositoryId == repositoryId)
-            .OrderBy(f => f.FilePath)
-            .ToListAsync();
-    }
-
-    public async Task<List<CodeSymbol>> GetFileOutlineAsync(Guid repositoryId, string filePath)
-    {
-        var file = await _db.CodeFiles
-            .FirstOrDefaultAsync(f => f.RepositoryId == repositoryId && f.FilePath == filePath);
-
-        if (file == null) return [];
+        var location = await _db.FileLocations.FirstOrDefaultAsync(l =>
+            l.ProjectId == projectId && l.HostId == hostId && l.RelPath == relPath);
+        if (location == null) return [];
 
         return await _db.CodeSymbols
-            .Where(s => s.FileId == file.FileId)
+            .Where(s => s.ProjectId == projectId && s.ContentSha256 == location.ContentSha256)
             .OrderBy(s => s.StartLine)
             .ToListAsync();
     }
 
-    public async Task<CodeSymbol?> GetSymbolByKeyAsync(Guid repositoryId, string symbolKey)
-    {
-        return await _db.CodeSymbols
-            .FirstOrDefaultAsync(s => s.RepositoryId == repositoryId && s.SymbolKey == symbolKey);
-    }
+    public Task<CodeSymbol?> GetSymbolByKeyAsync(string projectId, string symbolKey)
+        => _db.CodeSymbols.FirstOrDefaultAsync(s => s.ProjectId == projectId && s.SymbolKey == symbolKey);
 
-    public async Task<List<CodeSymbol>> GetSymbolsByKeysAsync(Guid repositoryId, List<string> symbolKeys)
-    {
-        return await _db.CodeSymbols
-            .Where(s => s.RepositoryId == repositoryId && symbolKeys.Contains(s.SymbolKey))
+    public Task<List<CodeSymbol>> GetSymbolsByKeysAsync(string projectId, List<string> symbolKeys)
+        => _db.CodeSymbols
+            .Where(s => s.ProjectId == projectId && symbolKeys.Contains(s.SymbolKey))
             .ToListAsync();
-    }
 
-    public async Task<List<CodeSymbol>> SearchSymbolsAsync(string query, Guid? repositoryId, string? kind, int limit)
+    public async Task<List<CodeSymbol>> SearchSymbolsAsync(string query, string? projectId, string? kind, int limit)
     {
         var q = _db.CodeSymbols.AsQueryable();
 
-        if (repositoryId.HasValue)
-            q = q.Where(s => s.RepositoryId == repositoryId.Value);
+        if (!string.IsNullOrEmpty(projectId))
+            q = q.Where(s => s.ProjectId == projectId);
 
         if (!string.IsNullOrEmpty(kind))
             q = q.Where(s => s.Kind == kind);
 
-        // Case-insensitive LIKE search on name and qualified name
-        q = q.Where(s => EF.Functions.Like(s.Name, $"%{query}%")
-                      || EF.Functions.Like(s.QualifiedName, $"%{query}%"));
+        if (!string.IsNullOrEmpty(query))
+        {
+            q = q.Where(s => EF.Functions.Like(s.Name, $"%{query}%")
+                          || EF.Functions.Like(s.QualifiedName, $"%{query}%"));
+        }
 
         return await q.OrderBy(s => s.Name).Take(limit).ToListAsync();
     }
 
-    public async Task UpdateRepositoryStatsAsync(Guid repositoryId)
+    public async Task<string?> ResolveSymbolRelPathAsync(string projectId, string symbolKey, string hostId)
     {
-        var repo = await _db.CodeRepositories.FindAsync(repositoryId);
-        if (repo == null) return;
+        var sym = await _db.CodeSymbols
+            .FirstOrDefaultAsync(s => s.ProjectId == projectId && s.SymbolKey == symbolKey);
+        if (sym == null) return null;
 
-        repo.FileCount = await _db.CodeFiles.CountAsync(f => f.RepositoryId == repositoryId);
-        repo.SymbolCount = await _db.CodeSymbols.CountAsync(s => s.RepositoryId == repositoryId);
-        repo.UpdatedAt = DateTimeOffset.UtcNow;
+        var loc = await _db.FileLocations
+            .Where(l => l.ProjectId == projectId
+                     && l.HostId == hostId
+                     && l.ContentSha256 == sym.ContentSha256)
+            .OrderBy(l => l.RelPath)
+            .FirstOrDefaultAsync();
+        return loc?.RelPath;
+    }
+
+    // ---------- Internals ----------
+
+    private async Task DeleteOrphanContentAsync(IEnumerable<string> hashes)
+    {
+        var distinct = hashes.Where(h => !string.IsNullOrEmpty(h)).Distinct().ToList();
+        if (distinct.Count == 0) return;
+
+        // A blob is orphan iff no file_location currently references it.
+        var stillReferenced = await _db.FileLocations
+            .Where(l => distinct.Contains(l.ContentSha256))
+            .Select(l => l.ContentSha256)
+            .Distinct()
+            .ToListAsync();
+
+        var toDelete = distinct.Except(stillReferenced).ToList();
+        if (toDelete.Count == 0) return;
+
+        // Drop symbols owned by orphan content (across all projects).
+        var orphanSymbols = _db.CodeSymbols.Where(s => toDelete.Contains(s.ContentSha256));
+        _db.CodeSymbols.RemoveRange(orphanSymbols);
+
+        var orphanFiles = _db.CodeFiles.Where(f => toDelete.Contains(f.ContentSha256));
+        _db.CodeFiles.RemoveRange(orphanFiles);
+
         await _db.SaveChangesAsync();
     }
 }

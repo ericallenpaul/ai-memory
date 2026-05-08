@@ -16,7 +16,13 @@ public class AIMemoryDbContext : DbContext
     public DbSet<IngestionLogEntry> IngestionLog => Set<IngestionLogEntry>();
     public DbSet<AdminUser> AdminUsers => Set<AdminUser>();
     public DbSet<MessageEmbedding> MessageEmbeddings => Set<MessageEmbedding>();
-    public DbSet<CodeRepository> CodeRepositories => Set<CodeRepository>();
+
+    // Distributed-ingestion identity surface (phase 6).
+    public DbSet<Host> Hosts => Set<Host>();
+    public DbSet<Project> Projects => Set<Project>();
+    public DbSet<FileLocation> FileLocations => Set<FileLocation>();
+    public DbSet<Pairing> Pairings => Set<Pairing>();
+
     public DbSet<CodeFile> CodeFiles => Set<CodeFile>();
     public DbSet<CodeSymbol> CodeSymbols => Set<CodeSymbol>();
     public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
@@ -215,40 +221,95 @@ public class AIMemoryDbContext : DbContext
             entity.HasIndex(e => e.SessionId);
         });
 
-        modelBuilder.Entity<CodeRepository>(entity =>
+        // ==================== Distributed identity (phase 6) ====================
+
+        modelBuilder.Entity<Host>(entity =>
         {
-            entity.ToTable("code_repositories");
-            entity.HasKey(e => e.RepositoryId);
-            entity.Property(e => e.RepositoryId).HasColumnName("repository_id");
-            entity.Property(e => e.Name).HasColumnName("name").IsRequired();
+            entity.ToTable("hosts");
+            entity.HasKey(e => e.HostId);
+            entity.Property(e => e.HostId).HasColumnName("host_id");
+            entity.Property(e => e.FriendlyName).HasColumnName("friendly_name").IsRequired();
+            entity.Property(e => e.OsKind).HasColumnName("os_kind").IsRequired();
+            entity.Property(e => e.IsLocal).HasColumnName("is_local");
+            entity.Property(e => e.FirstSeenAt).HasColumnName("first_seen_at");
+            entity.Property(e => e.LastSeenAt).HasColumnName("last_seen_at");
+
+            entity.HasIndex(e => e.FriendlyName).IsUnique();
+        });
+
+        modelBuilder.Entity<Project>(entity =>
+        {
+            entity.ToTable("projects");
+            entity.HasKey(e => e.ProjectId);
+            entity.Property(e => e.ProjectId).HasColumnName("project_id");
+            entity.Property(e => e.DisplayName).HasColumnName("display_name").IsRequired();
+            entity.Property(e => e.CanonicalRemoteUrl).HasColumnName("canonical_remote_url");
+            entity.Property(e => e.RootCommitSha).HasColumnName("root_commit_sha");
+            entity.Property(e => e.IdentityKind).HasColumnName("identity_kind").IsRequired();
             entity.Property(e => e.SourceType).HasColumnName("source_type").IsRequired();
             entity.Property(e => e.SourcePath).HasColumnName("source_path").IsRequired();
             entity.Property(e => e.DefaultBranch).HasColumnName("default_branch");
             entity.Property(e => e.FileCount).HasColumnName("file_count");
             entity.Property(e => e.SymbolCount).HasColumnName("symbol_count");
-            entity.Property(e => e.IndexedAt).HasColumnName("indexed_at");
-            entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
+            entity.Property(e => e.FirstSeenAt).HasColumnName("first_seen_at");
+            entity.Property(e => e.LastSeenAt).HasColumnName("last_seen_at");
 
-            entity.HasIndex(e => e.Name).IsUnique();
-            entity.HasIndex(e => e.SourceType);
+            entity.HasIndex(e => e.CanonicalRemoteUrl);
+            entity.HasIndex(e => e.DisplayName).IsUnique();
         });
+
+        modelBuilder.Entity<FileLocation>(entity =>
+        {
+            entity.ToTable("file_locations");
+            // Composite PK: same path on the same project for the same host.
+            entity.HasKey(e => new { e.HostId, e.ProjectId, e.RelPath });
+            entity.Property(e => e.HostId).HasColumnName("host_id");
+            entity.Property(e => e.ProjectId).HasColumnName("project_id");
+            entity.Property(e => e.RelPath).HasColumnName("rel_path");
+            entity.Property(e => e.ContentSha256).HasColumnName("content_sha256").IsRequired();
+            entity.Property(e => e.Language).HasColumnName("language").IsRequired();
+            entity.Property(e => e.FileSize).HasColumnName("file_size");
+            entity.Property(e => e.FirstSeenAt).HasColumnName("first_seen_at");
+            entity.Property(e => e.LastSeenAt).HasColumnName("last_seen_at");
+
+            entity.HasIndex(e => e.ContentSha256);
+            entity.HasIndex(e => e.ProjectId);
+        });
+
+        modelBuilder.Entity<Pairing>(entity =>
+        {
+            entity.ToTable("pairings");
+            entity.HasKey(e => e.PairingId);
+            entity.Property(e => e.PairingId).HasColumnName("pairing_id");
+            entity.Property(e => e.HostId).HasColumnName("host_id").IsRequired();
+            entity.Property(e => e.ApiKeyId).HasColumnName("api_key_id");
+            entity.Property(e => e.FriendlyName).HasColumnName("friendly_name").IsRequired();
+            entity.Property(e => e.PairedAt).HasColumnName("paired_at");
+            entity.Property(e => e.LastContactAt).HasColumnName("last_contact_at");
+            entity.Property(e => e.IsRevoked).HasColumnName("is_revoked");
+
+            // Partial unique index — one active pairing per host. Built in raw SQL inside the
+            // migration because EF doesn't natively model partial indexes (HasFilter works
+            // but we keep the WHERE clause in the migration for clarity alongside the rest of
+            // the distributed-identity DDL).
+            entity.HasIndex(e => e.HostId)
+                .IsUnique()
+                .HasFilter("is_revoked = 0")
+                .HasDatabaseName("ux_pairings_host_id");
+        });
+
+        // ==================== Code index (post-phase-6, content-addressed) ==================
 
         modelBuilder.Entity<CodeFile>(entity =>
         {
             entity.ToTable("code_files");
-            entity.HasKey(e => e.FileId);
-            entity.Property(e => e.FileId).HasColumnName("file_id");
-            entity.Property(e => e.RepositoryId).HasColumnName("repository_id");
-            entity.Property(e => e.FilePath).HasColumnName("file_path").IsRequired();
+            entity.HasKey(e => e.ContentSha256);
+            entity.Property(e => e.ContentSha256).HasColumnName("content_sha256");
             entity.Property(e => e.Language).HasColumnName("language").IsRequired();
             entity.Property(e => e.FileSize).HasColumnName("file_size");
-            entity.Property(e => e.ContentHash).HasColumnName("content_hash").IsRequired();
-            entity.Property(e => e.IndexedAt).HasColumnName("indexed_at");
+            entity.Property(e => e.FirstSeenAt).HasColumnName("first_seen_at");
+            entity.Property(e => e.LastSeenAt).HasColumnName("last_seen_at");
 
-            entity.Ignore(e => e.Repository);
-
-            entity.HasIndex(e => e.RepositoryId);
-            entity.HasIndex(e => new { e.RepositoryId, e.FilePath }).IsUnique();
             entity.HasIndex(e => e.Language);
         });
 
@@ -257,8 +318,8 @@ public class AIMemoryDbContext : DbContext
             entity.ToTable("code_symbols");
             entity.HasKey(e => e.SymbolId);
             entity.Property(e => e.SymbolId).HasColumnName("symbol_id");
-            entity.Property(e => e.FileId).HasColumnName("file_id");
-            entity.Property(e => e.RepositoryId).HasColumnName("repository_id");
+            entity.Property(e => e.ContentSha256).HasColumnName("content_sha256").IsRequired();
+            entity.Property(e => e.ProjectId).HasColumnName("project_id").IsRequired();
             entity.Property(e => e.SymbolKey).HasColumnName("symbol_key").IsRequired();
             entity.Property(e => e.Name).HasColumnName("name").IsRequired();
             entity.Property(e => e.QualifiedName).HasColumnName("qualified_name").IsRequired();
@@ -272,10 +333,8 @@ public class AIMemoryDbContext : DbContext
             entity.Property(e => e.ParentSymbolKey).HasColumnName("parent_symbol_key");
             entity.Property(e => e.IndexedAt).HasColumnName("indexed_at");
 
-            entity.Ignore(e => e.File);
-
-            entity.HasIndex(e => e.FileId);
-            entity.HasIndex(e => e.RepositoryId);
+            entity.HasIndex(e => e.ContentSha256);
+            entity.HasIndex(e => e.ProjectId);
             entity.HasIndex(e => e.SymbolKey);
             entity.HasIndex(e => e.Kind);
             entity.HasIndex(e => e.Name);

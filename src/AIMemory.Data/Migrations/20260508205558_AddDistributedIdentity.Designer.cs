@@ -3,6 +3,7 @@ using System;
 using AIMemory.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,9 +11,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace AIMemory.Data.Migrations
 {
     [DbContext(typeof(AIMemoryDbContext))]
-    partial class AIMemoryDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260508205558_AddDistributedIdentity")]
+    partial class AddDistributedIdentity
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.0");

@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AIMemory.Models\AIMemory.Models.csproj" />
+    <ProjectReference Include="..\AIMemory.Identity\AIMemory.Identity.csproj" />
   </ItemGroup>
 
   <ItemGroup>

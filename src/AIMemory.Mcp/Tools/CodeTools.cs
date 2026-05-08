@@ -159,11 +159,12 @@ public class CodeTools
 
     private async Task<string?> ResolveRepoIdAsync(string repoNameOrId)
     {
-        // Try as GUID first
-        if (Guid.TryParse(repoNameOrId, out _))
+        // Phase 6: ids are 64-char lowercase hex (sha-256). Detect by length+charset; fall
+        // back to name lookup. (Legacy GUIDs from before the migration won't resolve, but
+        // the API's /api/code/repos returns the canonical id.)
+        if (LooksLikeProjectId(repoNameOrId))
             return repoNameOrId;
 
-        // Look up by name
         var response = await _http.GetAsync("/api/code/repos");
         if (!response.IsSuccessStatusCode) return null;
 
@@ -171,6 +172,9 @@ public class CodeTools
         var match = repos?.FirstOrDefault(r =>
             r.Name.Equals(repoNameOrId, StringComparison.OrdinalIgnoreCase));
 
-        return match?.RepositoryId.ToString();
+        return match?.ProjectId;
     }
+
+    private static bool LooksLikeProjectId(string s) =>
+        s.Length == 64 && s.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
 }

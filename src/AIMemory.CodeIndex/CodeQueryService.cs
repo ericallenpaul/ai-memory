@@ -1,118 +1,130 @@
 using Microsoft.Extensions.Logging;
 using AIMemory.Data.Repositories;
+using AIMemory.Identity;
 using AIMemory.Models.Dtos;
 using AIMemory.Models.Entities;
 
 namespace AIMemory.CodeIndex;
 
+/// <summary>
+/// Read-side queries over the code index. Post-phase-6, queries are scoped by project_id
+/// (a 64-character lowercase hex SHA-256) plus the local host's id (so we look up file
+/// locations on the right machine).
+/// </summary>
 public class CodeQueryService
 {
     private readonly ICodeIndexRepository _repo;
+    private readonly IHostIdProvider _hostIds;
     private readonly ILogger<CodeQueryService> _logger;
 
-    public CodeQueryService(ICodeIndexRepository repo, ILogger<CodeQueryService> logger)
+    public CodeQueryService(ICodeIndexRepository repo, IHostIdProvider hostIds, ILogger<CodeQueryService> logger)
     {
         _repo = repo;
+        _hostIds = hostIds;
         _logger = logger;
     }
 
     public async Task<List<CodeRepoResponse>> ListRepositoriesAsync()
     {
-        var repos = await _repo.ListRepositoriesAsync();
-        return repos.Select(r => new CodeRepoResponse
-        {
-            RepositoryId = r.RepositoryId,
-            Name = r.Name,
-            SourceType = r.SourceType,
-            SourcePath = r.SourcePath,
-            FileCount = r.FileCount,
-            SymbolCount = r.SymbolCount,
-            IndexedAt = r.IndexedAt,
-            UpdatedAt = r.UpdatedAt
-        }).ToList();
+        var projects = await _repo.ListProjectsAsync();
+        return projects.Select(ToResponse).ToList();
     }
 
-    public async Task<FileTreeResponse?> GetFileTreeAsync(Guid repoId)
+    public async Task<FileTreeResponse?> GetFileTreeAsync(string projectId)
     {
-        var repo = await _repo.GetRepositoryAsync(repoId);
-        if (repo == null) return null;
+        var project = await _repo.GetProjectAsync(projectId);
+        if (project == null) return null;
 
-        var files = await _repo.GetFileTreeAsync(repoId);
+        var hostId = _hostIds.GetHostId();
+        var locations = await _repo.GetFileTreeAsync(projectId, hostId);
         return new FileTreeResponse
         {
-            RepositoryId = repoId,
-            Name = repo.Name,
-            Files = files.Select(f => new FileTreeNode
+            ProjectId = projectId,
+            Name = project.DisplayName,
+            Files = locations.Select(l => new FileTreeNode
             {
-                Path = f.FilePath,
-                Language = f.Language,
-                FileSize = f.FileSize,
-                SymbolCount = 0 // Populated below
+                Path = l.RelPath,
+                Language = l.Language,
+                FileSize = l.FileSize,
+                SymbolCount = 0
             }).ToList()
         };
     }
 
-    public async Task<FileOutlineResponse?> GetFileOutlineAsync(Guid repoId, string filePath)
+    public async Task<FileOutlineResponse?> GetFileOutlineAsync(string projectId, string filePath)
     {
-        var repo = await _repo.GetRepositoryAsync(repoId);
-        if (repo == null) return null;
+        var project = await _repo.GetProjectAsync(projectId);
+        if (project == null) return null;
 
-        var symbols = await _repo.GetFileOutlineAsync(repoId, filePath);
+        var hostId = _hostIds.GetHostId();
+        var symbols = await _repo.GetFileOutlineAsync(projectId, hostId, filePath);
+
+        // Look up language from the file_location for this host's view of the path. The
+        // outline returns symbols by content; multiple paths can share content, so we go
+        // through GetFileTreeAsync filtered to the path.
+        var tree = await _repo.GetFileTreeAsync(projectId, hostId);
+        var language = tree.FirstOrDefault(l => l.RelPath == filePath)?.Language ?? "unknown";
+
         return new FileOutlineResponse
         {
-            RepositoryId = repoId,
+            ProjectId = projectId,
             FilePath = filePath,
-            Language = symbols.FirstOrDefault()?.File?.Language ?? "unknown",
+            Language = language,
             Symbols = symbols.Select(ToOutline).ToList()
         };
     }
 
-    public async Task<SymbolResponse?> GetSymbolAsync(Guid repoId, string symbolKey)
+    public async Task<SymbolResponse?> GetSymbolAsync(string projectId, string symbolKey)
     {
-        var repo = await _repo.GetRepositoryAsync(repoId);
-        if (repo == null) return null;
+        var project = await _repo.GetProjectAsync(projectId);
+        if (project == null) return null;
 
-        var symbol = await _repo.GetSymbolByKeyAsync(repoId, symbolKey);
+        var symbol = await _repo.GetSymbolByKeyAsync(projectId, symbolKey);
         if (symbol == null) return null;
 
-        var sourceCode = await ReadSourceCodeAsync(repo.SourcePath, symbol);
-        return ToSymbolResponse(symbol, sourceCode);
+        var hostId = _hostIds.GetHostId();
+        var relPath = await _repo.ResolveSymbolRelPathAsync(projectId, symbolKey, hostId);
+        var sourceCode = await ReadSourceCodeAsync(project.SourcePath, relPath, symbol);
+        return ToSymbolResponse(symbol, relPath ?? string.Empty, sourceCode);
     }
 
-    public async Task<List<SymbolResponse>> GetSymbolsAsync(Guid repoId, List<string> symbolKeys)
+    public async Task<List<SymbolResponse>> GetSymbolsAsync(string projectId, List<string> symbolKeys)
     {
-        var repo = await _repo.GetRepositoryAsync(repoId);
-        if (repo == null) return [];
+        var project = await _repo.GetProjectAsync(projectId);
+        if (project == null) return [];
 
-        var symbols = await _repo.GetSymbolsByKeysAsync(repoId, symbolKeys);
+        var symbols = await _repo.GetSymbolsByKeysAsync(projectId, symbolKeys);
+        var hostId = _hostIds.GetHostId();
         var results = new List<SymbolResponse>();
 
         foreach (var symbol in symbols)
         {
-            var sourceCode = await ReadSourceCodeAsync(repo.SourcePath, symbol);
-            results.Add(ToSymbolResponse(symbol, sourceCode));
+            var relPath = await _repo.ResolveSymbolRelPathAsync(projectId, symbol.SymbolKey, hostId);
+            var sourceCode = await ReadSourceCodeAsync(project.SourcePath, relPath, symbol);
+            results.Add(ToSymbolResponse(symbol, relPath ?? string.Empty, sourceCode));
         }
 
         return results;
     }
 
-    public async Task<List<SymbolMatch>> SearchSymbolsAsync(string query, Guid? repoId, string? kind, int limit)
+    public async Task<List<SymbolMatch>> SearchSymbolsAsync(string query, string? projectId, string? kind, int limit)
     {
-        var symbols = await _repo.SearchSymbolsAsync(query, repoId, kind, limit);
-
-        // We need repo names — batch lookup
-        var repoIds = symbols.Select(s => s.RepositoryId).Distinct().ToList();
-        var repos = new Dictionary<Guid, string>();
-        foreach (var id in repoIds)
+        var symbols = await _repo.SearchSymbolsAsync(query, projectId, kind, limit);
+        var projectIds = symbols.Select(s => s.ProjectId).Distinct().ToList();
+        var projects = new Dictionary<string, Project>();
+        foreach (var id in projectIds)
         {
-            var repo = await _repo.GetRepositoryAsync(id);
-            if (repo != null) repos[id] = repo.Name;
+            var p = await _repo.GetProjectAsync(id);
+            if (p != null) projects[id] = p;
         }
 
-        return symbols.Select(s =>
+        var hostId = _hostIds.GetHostId();
+        var results = new List<SymbolMatch>(symbols.Count);
+        foreach (var s in symbols)
         {
-            var filePath = s.SymbolKey.Split("::")[0];
-            return new SymbolMatch
+            var filePath = await _repo.ResolveSymbolRelPathAsync(s.ProjectId, s.SymbolKey, hostId)
+                          ?? string.Empty;
+            results.Add(new SymbolMatch
             {
                 SymbolKey = s.SymbolKey,
                 Name = s.Name,
@@ -120,33 +132,34 @@ public class CodeQueryService
                 Kind = s.Kind,
                 Signature = s.Signature,
                 FilePath = filePath,
-                RepositoryName = repos.GetValueOrDefault(s.RepositoryId, "unknown")
-            };
-        }).ToList();
+                RepositoryName = projects.TryGetValue(s.ProjectId, out var pp) ? pp.DisplayName : "unknown"
+            });
+        }
+        return results;
     }
 
-    public async Task<RepoOutlineResponse?> GetRepoOutlineAsync(Guid repoId)
+    public async Task<RepoOutlineResponse?> GetRepoOutlineAsync(string projectId)
     {
-        var repo = await _repo.GetRepositoryAsync(repoId);
-        if (repo == null) return null;
+        var project = await _repo.GetProjectAsync(projectId);
+        if (project == null) return null;
 
-        var files = await _repo.GetFileTreeAsync(repoId);
+        var hostId = _hostIds.GetHostId();
+        var locations = await _repo.GetFileTreeAsync(projectId, hostId);
 
-        var languageGroups = files.GroupBy(f => f.Language).Select(g => new LanguageSummary
+        var languageGroups = locations.GroupBy(l => l.Language).Select(g => new LanguageSummary
         {
             Language = g.Key,
             FileCount = g.Count()
         }).OrderByDescending(l => l.FileCount).ToList();
 
-        var topDirs = files
-            .Select(f => f.FilePath.Split('/').FirstOrDefault() ?? "")
+        var topDirs = locations
+            .Select(l => l.RelPath.Split('/').FirstOrDefault() ?? "")
             .Where(d => !string.IsNullOrEmpty(d))
             .Distinct()
             .OrderBy(d => d)
             .ToList();
 
-        // Get key symbols: classes and top-level functions
-        var keySymbols = await _repo.SearchSymbolsAsync("", repoId, null, 50);
+        var keySymbols = await _repo.SearchSymbolsAsync("", projectId, null, 50);
         var filtered = keySymbols
             .Where(s => s.Kind is "class" or "interface" or "struct" or "record" or "enum")
             .Select(ToOutline)
@@ -155,34 +168,36 @@ public class CodeQueryService
 
         return new RepoOutlineResponse
         {
-            RepositoryId = repoId,
-            Name = repo.Name,
-            FileCount = repo.FileCount,
-            SymbolCount = repo.SymbolCount,
+            ProjectId = projectId,
+            Name = project.DisplayName,
+            FileCount = project.FileCount,
+            SymbolCount = project.SymbolCount,
             Languages = languageGroups,
             TopLevelDirectories = topDirs,
             KeySymbols = filtered
         };
     }
 
-    public async Task<List<TextMatch>> SearchTextAsync(string query, Guid? repoId, string? filePath, int limit)
+    public async Task<List<TextMatch>> SearchTextAsync(string query, string? projectId, string? filePath, int limit)
     {
-        if (repoId == null) return [];
+        if (string.IsNullOrEmpty(projectId)) return [];
 
-        var repo = await _repo.GetRepositoryAsync(repoId.Value);
-        if (repo == null || !Directory.Exists(repo.SourcePath)) return [];
+        var project = await _repo.GetProjectAsync(projectId);
+        if (project == null || !Directory.Exists(project.SourcePath)) return [];
 
-        var files = await _repo.GetFileTreeAsync(repoId.Value);
+        var hostId = _hostIds.GetHostId();
+        var locations = await _repo.GetFileTreeAsync(projectId, hostId);
         if (!string.IsNullOrEmpty(filePath))
-            files = files.Where(f => f.FilePath == filePath).ToList();
+            locations = locations.Where(l => l.RelPath == filePath).ToList();
 
         var matches = new List<TextMatch>();
 
-        foreach (var file in files)
+        foreach (var location in locations)
         {
             if (matches.Count >= limit) break;
 
-            var fullPath = Path.Combine(repo.SourcePath, file.FilePath.Replace('/', Path.DirectorySeparatorChar));
+            var fullPath = Path.Combine(project.SourcePath,
+                location.RelPath.Replace('/', Path.DirectorySeparatorChar));
             if (!File.Exists(fullPath)) continue;
 
             try
@@ -194,28 +209,29 @@ public class CodeQueryService
                     {
                         matches.Add(new TextMatch
                         {
-                            FilePath = file.FilePath,
+                            FilePath = location.RelPath,
                             LineNumber = i + 1,
                             LineContent = lines[i].TrimStart(),
-                            RepositoryName = repo.Name
+                            RepositoryName = project.DisplayName
                         });
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Failed to search file: {File}", file.FilePath);
+                _logger.LogDebug(ex, "Failed to search file: {File}", location.RelPath);
             }
         }
 
         return matches;
     }
 
-    private static async Task<string> ReadSourceCodeAsync(string repoSourcePath, CodeSymbol symbol)
+    private static async Task<string> ReadSourceCodeAsync(string projectSourcePath, string? relPath, CodeSymbol symbol)
     {
-        var filePath = symbol.SymbolKey.Split("::")[0];
-        var fullPath = Path.Combine(repoSourcePath, filePath.Replace('/', Path.DirectorySeparatorChar));
+        if (string.IsNullOrEmpty(relPath))
+            return "[file path not resolved on this host]";
 
+        var fullPath = Path.Combine(projectSourcePath, relPath.Replace('/', Path.DirectorySeparatorChar));
         if (!File.Exists(fullPath))
             return "[source file not found]";
 
@@ -223,13 +239,9 @@ public class CodeQueryService
         {
             var content = await File.ReadAllTextAsync(fullPath);
 
-            // Use byte offsets for precise extraction
             if (symbol.StartByte >= 0 && symbol.EndByte > symbol.StartByte && symbol.EndByte <= content.Length)
-            {
                 return content[(int)symbol.StartByte..(int)symbol.EndByte];
-            }
 
-            // Fall back to line-based extraction
             var lines = content.Split('\n');
             var start = Math.Max(0, symbol.StartLine - 1);
             var end = Math.Min(lines.Length, symbol.EndLine);
@@ -254,21 +266,29 @@ public class CodeQueryService
         ParentSymbolKey = s.ParentSymbolKey
     };
 
-    private static SymbolResponse ToSymbolResponse(CodeSymbol s, string sourceCode)
+    private static SymbolResponse ToSymbolResponse(CodeSymbol s, string relPath, string sourceCode) => new()
     {
-        var filePath = s.SymbolKey.Split("::")[0];
-        return new SymbolResponse
-        {
-            SymbolKey = s.SymbolKey,
-            Name = s.Name,
-            QualifiedName = s.QualifiedName,
-            Kind = s.Kind,
-            Signature = s.Signature,
-            Summary = s.Summary,
-            FilePath = filePath,
-            StartLine = s.StartLine,
-            EndLine = s.EndLine,
-            SourceCode = sourceCode
-        };
-    }
+        SymbolKey = s.SymbolKey,
+        Name = s.Name,
+        QualifiedName = s.QualifiedName,
+        Kind = s.Kind,
+        Signature = s.Signature,
+        Summary = s.Summary,
+        FilePath = relPath,
+        StartLine = s.StartLine,
+        EndLine = s.EndLine,
+        SourceCode = sourceCode
+    };
+
+    private static CodeRepoResponse ToResponse(Project p) => new()
+    {
+        ProjectId = p.ProjectId,
+        Name = p.DisplayName,
+        SourceType = p.SourceType,
+        SourcePath = p.SourcePath,
+        FileCount = p.FileCount,
+        SymbolCount = p.SymbolCount,
+        IndexedAt = p.FirstSeenAt,
+        UpdatedAt = p.LastSeenAt
+    };
 }

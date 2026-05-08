@@ -15,7 +15,7 @@ public class IndexGitHubRequest
 
 public class CodeRepoResponse
 {
-    public Guid RepositoryId { get; set; }
+    public string ProjectId { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public string SourceType { get; set; } = string.Empty;
     public string SourcePath { get; set; } = string.Empty;
@@ -35,7 +35,7 @@ public class FileTreeNode
 
 public class FileTreeResponse
 {
-    public Guid RepositoryId { get; set; }
+    public string ProjectId { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public List<FileTreeNode> Files { get; set; } = [];
 }
@@ -55,7 +55,7 @@ public class SymbolOutline
 
 public class FileOutlineResponse
 {
-    public Guid RepositoryId { get; set; }
+    public string ProjectId { get; set; } = string.Empty;
     public string FilePath { get; set; } = string.Empty;
     public string Language { get; set; } = string.Empty;
     public List<SymbolOutline> Symbols { get; set; } = [];
@@ -96,7 +96,7 @@ public class TextMatch
 
 public class RepoOutlineResponse
 {
-    public Guid RepositoryId { get; set; }
+    public string ProjectId { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public int FileCount { get; set; }
     public int SymbolCount { get; set; }

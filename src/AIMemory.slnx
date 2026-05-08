@@ -6,6 +6,7 @@
   <Project Path="AIMemory.Ingestor/AIMemory.Ingestor.csproj" />
   <Project Path="AIMemory.Ingestor.ConfigApp/AIMemory.Ingestor.ConfigApp.csproj" />
   <Project Path="AIMemory.CodeIndex/AIMemory.CodeIndex.csproj" />
+  <Project Path="AIMemory.Identity/AIMemory.Identity.csproj" />
   <Project Path="AIMemory.Mcp/AIMemory.Mcp.csproj" />
   <Project Path="AIMemory.Models/AIMemory.Models.csproj" />
 </Solution>

@@ -22,9 +22,13 @@ name = "aimemory-desktop"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "reqwest 0.12.28",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

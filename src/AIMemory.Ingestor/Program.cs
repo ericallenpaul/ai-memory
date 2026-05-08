@@ -24,6 +24,25 @@ builder.Configuration.AddJsonFile(programDataConfigPath, optional: true, reloadO
 var runOnce = args.Contains("--once");
 var testRedaction = args.Contains("--test-redaction");
 var showStatus = args.Contains("--status");
+var printHostId = args.Contains("--print-host-id");
+
+// --print-host-id is consumed by the desktop pairing wizard (phase 9). It needs the
+// machine's stable host_id BEFORE the ingestor service is configured (the wizard issues
+// POST /api/pairings on the user's behalf, which requires the host_id in the body). Doing
+// it inline here keeps HostIdProvider as the single source of truth — the wizard doesn't
+// need to re-implement the algorithm in Rust. We resolve the salt directory the same way
+// the rest of startup does and exit immediately, before any DI/host wiring runs.
+if (printHostId)
+{
+    var saltDirEarly = OperatingSystem.IsWindows()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "AIMemory", "Ingestor")
+        : InstallSaltStore.GetDefaultDirectory();
+    Directory.CreateDirectory(saltDirEarly);
+    var earlySaltStore = new InstallSaltStore(saltDirEarly);
+    var earlyProvider = new HostIdProvider(earlySaltStore);
+    Console.WriteLine(earlyProvider.GetHostId());
+    return;
+}
 
 builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
 {

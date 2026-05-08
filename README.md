@@ -22,7 +22,7 @@ expensive "load the whole file into context" patterns with precise, low-token sy
 │  - Controls Windows Services │         │     ▼                      │
 │  - Reads runtime.json        │         │  aimemory-mcp.exe (stdio)  │
 └────────────┬─────────────────┘         └────────────┬───────────────┘
-             │ HTTP + X-API-Key                       │ HTTP + X-API-Key
+             │ HTTP + X-AIMemory-Api-Key                       │ HTTP + X-AIMemory-Api-Key
              ▼                                        ▼
    ┌───────────────────────────────────────────────────────────────┐
    │  Windows Service: aimemory-api  (always running)              │
@@ -49,6 +49,41 @@ services, not their host.
 
 ---
 
+## Distributed mode
+
+The default deployment is single-machine — desktop + API + ingestor on one box,
+one SQLite database. **Distributed mode** is an opt-in second deployment shape
+where a remote machine runs only the ingestor and forwards code-index events
+over the LAN to a primary AIMemory server. Use it when you have multiple dev
+machines and want one centralized index.
+
+The same NSIS installer offers two install modes on a "Setup Type" page:
+
+- **Full install** *(default)* — desktop + both services. The primary in a
+  distributed setup is a full install with remote ingestors enabled.
+- **Ingestor-only (Remote node)** — only `aimemory-ingestor` plus a one-time
+  pairing wizard. No local API, no dashboard.
+
+Pairing flow: on the primary, open the desktop's **Distributed** page and toggle
+**Allow remote ingestors**. The API generates a self-signed TLS cert, issues an
+ingest-scoped API key, and rebinds to a LAN interface you pick from a dropdown
+(or a custom IPv4). The page reveals three values — endpoint URL, API key, and
+cert fingerprint — once. On the secondary, run the ingestor-only installer and
+paste those three values into the wizard. The wizard pins the cert
+fingerprint, authenticates, and registers the host. Subsequent ingest batches
+flow over HTTPS with `X-AIMemory-Api-Key` auth.
+
+Cross-host content dedupes — same git repo on two machines is one project, same
+file content on two machines is one blob — while preserving per-host
+provenance via a `file_locations` table.
+
+End-to-end walkthrough, troubleshooting, and the security model are in
+[`docs/distributed-mode-guide.md`](./docs/distributed-mode-guide.md). The
+schema, wire protocol, threat model, and deferred items are in
+[`docs/distributed-ingestion-design.md`](./docs/distributed-ingestion-design.md).
+
+---
+
 ## Repository layout
 
 | Path | What |
@@ -62,8 +97,8 @@ services, not their host.
 | `src/AIMemory.Data/` | EF Core DbContext + repositories. SQLite default; PostgreSQL provider available but not used in the desktop bundle. |
 | `src/AIMemory.Ingestor.ConfigApp/` | **Retired.** WPF Windows-only configuration utility, superseded by `apps/desktop/`. |
 | `src/aimemory.client/` | **Retired (for active development).** React+Vite web SPA, kept as reference. The Tauri shell replaces it. |
-| `tests/AIMemory.Tests.Unit/` | 203 unit tests (xUnit). Covers parsers, file filter, code adapter (with git mode), git change detector, and API key repo. |
-| `tests/AIMemory.Tests.Integration/` | Smoke tests against the developer's actual repo dir (skipped automatically when paths don't exist). |
+| `tests/AIMemory.Tests.Unit/` | 364 unit tests (xUnit). Covers parsers, file filter, code adapter (with git mode), git change detector, API key repo, identity (host/project resolvers), TLS fingerprint, pairing repo, distributed config, ingestor sinks, and bind-interface validation. |
+| `tests/AIMemory.Tests.Integration/` | 9 tests. Includes the developer-repo smoke tests (skipped when paths don't exist) and the in-process two-host distributed-ingestion smoke (`DistributedIngestionSmokeTests`). |
 
 ---
 
@@ -83,7 +118,7 @@ services, not their host.
 # 1. Restore + build everything
 dotnet build src/AIMemory.slnx
 
-# 2. Run all tests (203 unit + 6 integration smoke)
+# 2. Run all tests (364 unit + 9 integration)
 dotnet test src/AIMemory.slnx
 
 # 3. Run the API standalone (no Tauri yet)
@@ -111,10 +146,17 @@ runtime.json the API writes.
 ```
 1. Download AIMemory Desktop_<ver>_x64-setup.exe
 2. Run it. The installer detects .NET 10; prompts to install if missing.
-3. The installer registers `aimemory-api` and `aimemory-ingestor` as
-   Windows Services with start type Automatic.
-4. Both services start. AIMemory Desktop opens.
-5. Click "Add folder" to index a repository.
+3. On the "Setup Type" page, pick:
+     * Full install (default) — for a single-machine setup, or for the
+       primary in a distributed setup.
+     * Ingestor-only (Remote node) — for a secondary that forwards
+       events to a remote primary. See docs/distributed-mode-guide.md.
+4. Full install: registers `aimemory-api` and `aimemory-ingestor` as
+   Windows Services (start type Automatic), starts both, opens the
+   desktop dashboard.
+   Ingestor-only: registers `aimemory-ingestor` only, opens the
+   pairing wizard. The service starts after pairing succeeds.
+5. (Full install) Click "Add folder" to index a repository.
 6. (For Claude Code users) Register the MCP server:
       claude mcp add aimemory "C:\Program Files\AIMemory Desktop\AIMemory.Mcp.exe"
 ```
@@ -183,14 +225,25 @@ Configurable per source in `appsettings.json`:
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/ingest/batch` | Batch ingest events (CodeFileUpsert, CodeSymbolBatch, **CodeFileDelete**) |
+| POST | `/api/ingest/batch` | Batch ingest events (CodeFileUpsert, CodeSymbolBatch, **CodeFileDelete**). Optional per-batch `HostId` / `ProjectId` for distributed mode; unknown `HostId` is rejected with 403. |
 | GET | `/api/ingestor/recent` | Recent code-indexer events for the Tauri Services page |
 
 ### Admin (Tauri DB browser)
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/admin/tables/{name}?limit=&offset=` | Whitelisted read-only inspector over `code_repositories`, `code_files`, `code_symbols`, `ingestion_log` |
+| GET | `/api/admin/tables/{name}?limit=&offset=` | Whitelisted read-only inspector over `code_repositories`, `code_files`, `code_symbols`, `ingestion_log`, `hosts`, `projects`, `file_locations`, `pairings` |
+
+### Distributed (primary admin)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/admin/distributed/enable?bindInterface=<ip>` | Generate cert, issue ingest key, set bind. See [`docs/distributed-mode-guide.md`](./docs/distributed-mode-guide.md). |
+| POST | `/api/admin/distributed/disable` | Restore loopback bind; keep cached fingerprint. |
+| GET | `/api/admin/distributed/status` | Current bind interface, port, fingerprint, paired-host count. |
+| POST | `/api/pairings` | Secondary registers itself (host id, friendly name, OS kind, version). |
+| GET | `/api/pairings` | List paired hosts. |
+| DELETE | `/api/pairings/{id}` | Revoke a pairing and cascade-revoke its api key. |
 
 ### Health / Stats
 
@@ -248,7 +301,8 @@ deployments.
 | 2 | ✅ Done | Tauri shell scaffold, Rust SCM service control, NSIS installer with .NET prereq detection |
 | 3 | ✅ Done | Admin tables endpoint, ingestor recent events feed, all UI pages |
 | 4 | ✅ Done | runtime.json discovery, MCP discovery, smoke tests, this README |
-| Future | — | macOS/Linux installer parity, GitHub remote indexing, per-symbol embeddings |
+| 5–11 | ✅ Done | **Distributed ingestion**: schema migration, identity layer, TLS + pairing, RemoteSink, desktop admin UI, ingestor wizard, NSIS component selection, .NET binaries bundled in the installer |
+| Future | — | macOS/Linux installer parity, GitHub remote indexing, per-symbol embeddings, cert/key rotation UX |
 
 ---
 

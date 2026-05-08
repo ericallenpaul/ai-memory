@@ -53,6 +53,9 @@ mod platform {
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+    // Stable Win32 system error: returned by OpenService when the named service is not registered.
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
     fn manager() -> Result<ServiceManager, DesktopError> {
         // CONNECT is sufficient for query/start/stop. We never create services from the
         // running app — the installer (Phase 2.6) does that with full admin access.
@@ -67,7 +70,7 @@ mod platform {
         let service = match manager.open_service(name.windows_name(), access) {
             Ok(s) => s,
             Err(windows_service::Error::Winapi(e))
-                if e.raw_os_error() == Some(windows_service::sc_error::ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+                if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
             {
                 return Ok(ServiceStatus {
                     name,
@@ -93,7 +96,7 @@ mod platform {
         let pid = info.process_id;
         let display_name = service.query_config()
             .ok()
-            .map(|c| c.display_name);
+            .and_then(|c| c.display_name.into_string().ok());
 
         Ok(ServiceStatus { name, state, pid, display_name })
     }

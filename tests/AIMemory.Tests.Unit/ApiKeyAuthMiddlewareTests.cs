@@ -1,3 +1,4 @@
+using System.Net;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -64,7 +65,7 @@ public class ApiKeyAuthMiddlewareTests
         ctx.Response.Body = new MemoryStream();
 
         if (apiKey != null)
-            ctx.Request.Headers["X-API-Key"] = apiKey;
+            ctx.Request.Headers[ApiKeyAuthMiddleware.HeaderName] = apiKey;
 
         if (isAuthenticated)
         {
@@ -385,5 +386,163 @@ public class ApiKeyAuthMiddlewareTests
         await middleware.InvokeAsync(ctx);
 
         Assert.Equal(401, ctx.Response.StatusCode);
+    }
+
+    // ===== Phase 7a: hard-cut to X-AIMemory-Api-Key header =====
+
+    [Fact]
+    public async Task InvokeAsync_LegacyHeaderName_DoesNotAuthenticate()
+    {
+        // Sending the old X-API-Key header on a non-loopback request must fail with 401 —
+        // phase 7a removed dual-accept support.
+        var (middleware, _) = BuildMiddleware();
+        var ctx = MakeContext("/api/ingest");
+        ctx.Request.Headers["X-API-Key"] = "anything";
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Equal(401, ctx.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_NewHeaderName_AuthenticatesWithLegacyKey()
+    {
+        // The env-var legacy key still works as the admin scope when sent under the new header.
+        const string legacyKey = "legacy-env-key";
+        var (middleware, invoked) = BuildMiddleware(legacyApiKey: legacyKey);
+        var ctx = MakeContext("/api/ingest", apiKey: legacyKey);
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Contains("/api/ingest", invoked);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_Returns401WithWWWAuthenticateHeader()
+    {
+        // Failed auth must include a WWW-Authenticate header per RFC 7235 — clients need
+        // to know the scheme to use.
+        var (middleware, _) = BuildMiddleware();
+        var ctx = MakeContext("/api/ingest");
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Equal(401, ctx.Response.StatusCode);
+        Assert.True(ctx.Response.Headers.ContainsKey("WWW-Authenticate"));
+        var hdr = ctx.Response.Headers["WWW-Authenticate"].ToString();
+        Assert.Contains("ApiKey", hdr);
+        Assert.Contains(ApiKeyAuthMiddleware.HeaderName, hdr);
+    }
+
+    // ===== Phase 7a: loopback bypass (preserves single-machine ingest path) =====
+
+    [Theory]
+    [InlineData("/api/ingest")]
+    [InlineData("/api/code")]
+    [InlineData("/api/keys")]
+    public async Task InvokeAsync_LoopbackRequestWithoutKey_PassesThrough(string path)
+    {
+        // Requests originating from 127.0.0.1 without any API key are still allowed for
+        // back-compat with the in-process single-machine ingestor (phase 7b will tighten).
+        var (middleware, invoked) = BuildMiddleware();
+        var ctx = MakeContext(path);
+        ctx.Connection.RemoteIpAddress = IPAddress.Loopback;
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Contains(path, invoked);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_IPv6LoopbackRequestWithoutKey_PassesThrough()
+    {
+        var (middleware, invoked) = BuildMiddleware();
+        var ctx = MakeContext("/api/ingest");
+        ctx.Connection.RemoteIpAddress = IPAddress.IPv6Loopback;
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Contains("/api/ingest", invoked);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_RemoteRequestWithoutKey_Returns401()
+    {
+        // A non-loopback request with no key MUST be rejected — distributed mode entry path.
+        var (middleware, _) = BuildMiddleware();
+        var ctx = MakeContext("/api/ingest");
+        ctx.Connection.RemoteIpAddress = IPAddress.Parse("192.168.1.42");
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Equal(401, ctx.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_RemoteRequestWithValidKey_PassesThrough()
+    {
+        var key = new ApiKey
+        {
+            ApiKeyId = Guid.NewGuid(),
+            KeyHash = Sha256("remote-ingest-key"),
+            KeyPrefix = "ak_",
+            Name = "remote",
+            Scopes = ["ingest"],
+            IsActive = true
+        };
+
+        var (middleware, invoked) = BuildMiddleware(dbKey: key);
+        var ctx = MakeContext("/api/ingest", apiKey: "remote-ingest-key");
+        ctx.Connection.RemoteIpAddress = IPAddress.Parse("192.168.1.42");
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Contains("/api/ingest", invoked);
+    }
+
+    // ===== Phase 7a: scope mapping for new admin paths =====
+
+    [Fact]
+    public async Task InvokeAsync_PairingsPath_RequiresAdminScope()
+    {
+        var key = new ApiKey
+        {
+            ApiKeyId = Guid.NewGuid(),
+            KeyHash = Sha256("ingest-only-pairings"),
+            KeyPrefix = "ak_",
+            Name = "ingest-only",
+            Scopes = ["ingest"],
+            IsActive = true
+        };
+
+        var (middleware, _) = BuildMiddleware(dbKey: key);
+        var ctx = MakeContext("/api/pairings", apiKey: "ingest-only-pairings");
+        ctx.Connection.RemoteIpAddress = IPAddress.Parse("10.0.0.1");
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Equal(403, ctx.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_AdminDistributedPath_RequiresAdminScope()
+    {
+        var key = new ApiKey
+        {
+            ApiKeyId = Guid.NewGuid(),
+            KeyHash = Sha256("admin-dist"),
+            KeyPrefix = "ak_",
+            Name = "admin",
+            Scopes = ["admin"],
+            IsActive = true
+        };
+
+        var (middleware, invoked) = BuildMiddleware(dbKey: key);
+        var ctx = MakeContext("/api/admin/distributed/status", apiKey: "admin-dist");
+        ctx.Connection.RemoteIpAddress = IPAddress.Parse("10.0.0.1");
+
+        await middleware.InvokeAsync(ctx);
+
+        Assert.Contains("/api/admin/distributed/status", invoked);
     }
 }

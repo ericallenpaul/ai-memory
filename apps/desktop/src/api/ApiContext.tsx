@@ -22,9 +22,9 @@ interface ApiContextValue extends Pick<ApiState, "status"> {
   error?: string;
   refetch: () => Promise<void>;
   /**
-   * Convenience fetch that prepends the configured base URL and adds the X-API-Key
-   * header. Throws if the runtime config hasn't loaded yet — pages should gate on
-   * `status === "ready"` before calling.
+   * Convenience fetch that prepends the configured base URL and adds the
+   * X-AIMemory-Api-Key header. Throws if the runtime config hasn't loaded yet — pages
+   * should gate on `status === "ready"` before calling.
    */
   api: (path: string, init?: RequestInit) => Promise<Response>;
 }
@@ -55,7 +55,7 @@ export function ApiProvider({ children }: { children: ReactNode }) {
     }
     const url = `${state.config.baseUrl}${path}`;
     const headers = new Headers(init?.headers);
-    headers.set("X-API-Key", state.config.apiKey);
+    headers.set("X-AIMemory-Api-Key", state.config.apiKey);
     if (init?.body && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }

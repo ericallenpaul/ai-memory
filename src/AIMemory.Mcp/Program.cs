@@ -59,7 +59,7 @@ Action<HttpClient> configureClient = client =>
     client.BaseAddress = new Uri(apiBaseUrl);
     client.Timeout = TimeSpan.FromSeconds(30);
     if (!string.IsNullOrEmpty(apiKey))
-        client.DefaultRequestHeaders.Add("X-API-Key", apiKey);
+        client.DefaultRequestHeaders.Add("X-AIMemory-Api-Key", apiKey);
 };
 
 builder.Services.AddHttpClient<AIMemory.Mcp.Tools.AIMemoryTools>(configureClient);

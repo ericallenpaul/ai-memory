@@ -1,12 +1,16 @@
+using System.Net;
 using System.Security.Claims;
 using System.Text.Json;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.EntityFrameworkCore;
 using NLog.Web;
+using AIMemory.Api.Distributed;
 using AIMemory.Api.Middleware;
+using AIMemory.Api.Tls;
 using AIMemory.Data;
 using AIMemory.Data.Repositories;
 using AIMemory.Models.Dtos;
@@ -38,6 +42,11 @@ var isDevelopment = builder.Environment.IsDevelopment();
 var configuredPort = builder.Configuration.GetValue<int>("AIMemory:Port");
 var portFilePath = Path.Combine(programDataConfigDir, "port");
 
+// Distributed-ingestion listener config. Persisted to distributed.json so the Allow-remote
+// toggle and TLS state survive restarts. Phase 7a — see docs/distributed-ingestion-design.md §3.6.
+var distributedStore = new DistributedConfigStore(programDataConfigDir);
+var distributedConfig = distributedStore.Load();
+
 if (!isDevelopment)
 {
     if (configuredPort <= 0 && File.Exists(portFilePath)
@@ -48,15 +57,60 @@ if (!isDevelopment)
 
     if (configuredPort <= 0)
     {
-        configuredPort = Random.Shared.Next(49152, 65536);
+        // Prefer the persisted distributed port over a random one so the bind/HTTPS pair stays stable.
+        configuredPort = distributedConfig.BindPort > 0
+            ? distributedConfig.BindPort
+            : Random.Shared.Next(49152, 65536);
     }
 
-    builder.WebHost.UseUrls($"http://localhost:{configuredPort}");
+    // Bind interface: localhost by default, 0.0.0.0 (or user-chosen) when distributed mode is on.
+    var bindAddress = distributedConfig.Enabled
+        ? (string.IsNullOrWhiteSpace(distributedConfig.BindAddress) ? "0.0.0.0" : distributedConfig.BindAddress)
+        : "127.0.0.1";
+
+    // Persist the resolved port back into the distributed config so the next start (and the
+    // status endpoint) report the actual listener port even if the user never set one explicitly.
+    distributedConfig.BindPort = configuredPort;
+    distributedConfig.BindAddress = bindAddress;
+
+    if (distributedConfig.Enabled)
+    {
+        // HTTPS with the persisted self-signed cert. Generate (or load) the cert eagerly so the
+        // fingerprint published in runtime.json is in sync with what Kestrel actually presents.
+        var tlsProvider = new TlsCertificateProvider(programDataConfigDir);
+        var cert = tlsProvider.GetOrCreate(extraSanHosts: BuildSanHostsForBindAddress(bindAddress));
+        distributedConfig.TlsFingerprint = CertFingerprint.Compute(cert);
+
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            // Loopback HTTP stays available so existing local clients (MCP, desktop) don't have to
+            // switch to HTTPS — they'd need to pin the fingerprint too, and the desktop reads
+            // runtime.json from the same machine anyway.
+            options.Listen(IPAddress.Loopback, configuredPort);
+            // Remote-facing HTTPS listener.
+            if (IPAddress.TryParse(bindAddress, out var bindIp) && !IPAddress.IsLoopback(bindIp))
+            {
+                options.Listen(bindIp, configuredPort, listen =>
+                {
+                    listen.UseHttps(cert);
+                });
+            }
+        });
+    }
+    else
+    {
+        builder.WebHost.UseUrls($"http://localhost:{configuredPort}");
+    }
+
+    distributedStore.Save(distributedConfig);
 }
 else
 {
     // In dev, use 5219 as the known port (matches launchSettings + Vite proxy config)
     configuredPort = 5219;
+    distributedConfig.BindPort = configuredPort;
+    distributedConfig.BindAddress = "127.0.0.1";
+    distributedStore.Save(distributedConfig);
 }
 
 // Persist the port so the ingestor and config app can discover it
@@ -64,19 +118,33 @@ Directory.CreateDirectory(programDataConfigDir);
 File.WriteAllText(portFilePath, configuredPort.ToString());
 
 // runtime.json — the canonical "where is the API?" file the Tauri shell and MCP server
-// read on startup. Contains baseUrl + apiKey + port. The apiKey field is filled in
-// later, after we've confirmed the desktop key exists in the api_keys table; for now
-// we write a placeholder so the file is discoverable. Phase 4 will key-init this on
-// the first boot if the desktop key row is missing.
+// read on startup. Contains baseUrl + apiKey + port + (phase 7a) tls fingerprint and bind
+// address so the desktop UI can render the Distributed settings page without re-reading
+// distributed.json itself.
 var runtimeJsonPath = Path.Combine(programDataConfigDir, "runtime.json");
 var legacyApiKey = Environment.GetEnvironmentVariable("AIMEMORY_API_KEY") ?? "";
+var runtimeBaseUrl = distributedConfig.Enabled
+    ? $"https://{distributedConfig.BindAddress}:{configuredPort}"
+    : $"http://127.0.0.1:{configuredPort}";
+
 File.WriteAllText(runtimeJsonPath,
     System.Text.Json.JsonSerializer.Serialize(new
     {
-        baseUrl = $"http://127.0.0.1:{configuredPort}",
+        baseUrl = runtimeBaseUrl,
         apiKey = legacyApiKey,
-        port = configuredPort
+        port = configuredPort,
+        bind_interface = distributedConfig.BindAddress,
+        bind_port = configuredPort,
+        tls_fingerprint = distributedConfig.TlsFingerprint
     }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+
+// Helper at file scope below; declared here so the lambda above can reference it.
+static IEnumerable<string> BuildSanHostsForBindAddress(string bindAddress)
+{
+    if (string.IsNullOrWhiteSpace(bindAddress)) yield break;
+    if (bindAddress == "0.0.0.0" || bindAddress == "::") yield break; // wildcard, no SAN to add
+    yield return bindAddress;
+}
 
 // NLog
 builder.Logging.ClearProviders();
@@ -163,6 +231,11 @@ builder.Services.AddSingleton<IInstallSaltStore>(_ => InstallSaltStore.CreateDef
 builder.Services.AddSingleton<IHostIdProvider, HostIdProvider>();
 builder.Services.AddSingleton<IProjectIdResolver, ProjectIdResolver>();
 builder.Services.AddScoped<LegacyProjectMigrator>();
+
+// Distributed-ingestion (phase 7a)
+var configDirCapture = programDataConfigDir;
+builder.Services.AddSingleton(sp => new DistributedConfigStore(configDirCapture));
+builder.Services.AddSingleton(sp => new TlsCertificateProvider(configDirCapture));
 
 // Code Index services
 builder.Services.AddSingleton<FileFilter>();
@@ -499,6 +572,206 @@ app.MapGet("/api/ingestor/recent", async (int? limit, AIMemoryDbContext db) =>
     return Results.Ok(entries);
 }).RequireRateLimiting("general");
 
+// ==================== Pairings (phase 7a) ====================
+//
+// Per design doc §3.2 / §4.1: secondaries register themselves with POST /api/pairings; the
+// primary's UI lists with GET and revokes with DELETE. All routes require an admin-scoped
+// API key (enforced by ApiKeyAuthMiddleware's /api/pairings → ["admin"] mapping).
+
+app.MapPost("/api/pairings", async (CreatePairingRequest request,
+    IPairingRepository pairingRepo, IHostRepository hostRepo, ILoggerFactory loggerFactory) =>
+{
+    var pairLogger = loggerFactory.CreateLogger("AIMemory.Api.Pairings");
+
+    if (string.IsNullOrWhiteSpace(request.HostId))
+        return Results.BadRequest(new { error = "HostId is required" });
+    if (request.HostId.Length != 64)
+        return Results.BadRequest(new { error = "HostId must be 64 hex chars" });
+    if (string.IsNullOrWhiteSpace(request.FriendlyName))
+        return Results.BadRequest(new { error = "FriendlyName is required" });
+    if (string.IsNullOrWhiteSpace(request.OsKind))
+        return Results.BadRequest(new { error = "OsKind is required" });
+
+    // Idempotent on host_id: a re-POST for the same host with an existing active pairing
+    // returns the existing record. This makes wizard re-runs safe.
+    var existing = await pairingRepo.GetActiveByHostIdAsync(request.HostId);
+    if (existing != null)
+    {
+        return Results.Ok(new PairingResponse
+        {
+            PairingId = existing.PairingId,
+            HostId = existing.HostId,
+            FriendlyName = existing.FriendlyName,
+            PairedAt = existing.PairedAt,
+            LastContactAt = existing.LastContactAt,
+            IsRevoked = existing.IsRevoked
+        });
+    }
+
+    // Ensure the host row exists. Phase 7a doesn't yet bind a per-pairing api_key (that's
+    // surfaced by the admin/distributed/enable flow); ApiKeyId is left at Guid.Empty here
+    // and tracked separately via the api_keys table revocation flow.
+    await hostRepo.UpsertAsync(new AIMemory.Models.Entities.Host
+    {
+        HostId = request.HostId,
+        FriendlyName = request.FriendlyName,
+        OsKind = request.OsKind,
+        IsLocal = false
+    });
+
+    var pairing = await pairingRepo.CreateAsync(new AIMemory.Models.Entities.Pairing
+    {
+        HostId = request.HostId,
+        FriendlyName = request.FriendlyName,
+        ApiKeyId = Guid.Empty
+    });
+
+    pairLogger.LogInformation("Pairing created: {PairingId} for host {HostId} ({FriendlyName})",
+        pairing.PairingId, pairing.HostId, pairing.FriendlyName);
+
+    return Results.Created($"/api/pairings/{pairing.PairingId}", new PairingResponse
+    {
+        PairingId = pairing.PairingId,
+        HostId = pairing.HostId,
+        FriendlyName = pairing.FriendlyName,
+        PairedAt = pairing.PairedAt,
+        LastContactAt = pairing.LastContactAt,
+        IsRevoked = pairing.IsRevoked
+    });
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/pairings", async (bool? includeRevoked, IPairingRepository pairingRepo) =>
+{
+    var pairings = await pairingRepo.ListAsync(includeRevoked ?? false);
+    return Results.Ok(pairings.Select(p => new PairingResponse
+    {
+        PairingId = p.PairingId,
+        HostId = p.HostId,
+        FriendlyName = p.FriendlyName,
+        PairedAt = p.PairedAt,
+        LastContactAt = p.LastContactAt,
+        IsRevoked = p.IsRevoked
+    }));
+}).RequireRateLimiting("general");
+
+app.MapDelete("/api/pairings/{id:guid}", async (Guid id,
+    IPairingRepository pairingRepo, IApiKeyRepository keyRepo, ILoggerFactory loggerFactory) =>
+{
+    var pairLogger = loggerFactory.CreateLogger("AIMemory.Api.Pairings");
+    var pairing = await pairingRepo.GetAsync(id);
+    if (pairing == null)
+        return Results.NotFound(new { error = "Pairing not found" });
+
+    var revoked = await pairingRepo.RevokeAsync(id);
+    if (!revoked)
+        return Results.Ok(new { message = "Pairing was already revoked" });
+
+    // Cascade: deactivate the linked api key so the secondary's subsequent requests 401.
+    if (pairing.ApiKeyId != Guid.Empty)
+    {
+        try
+        {
+            await keyRepo.RevokeAsync(pairing.ApiKeyId);
+        }
+        catch (Exception ex)
+        {
+            pairLogger.LogWarning(ex, "Failed to revoke linked API key {KeyId} for pairing {PairingId}",
+                pairing.ApiKeyId, id);
+        }
+    }
+
+    pairLogger.LogInformation("Pairing {PairingId} revoked for host {HostId}", id, pairing.HostId);
+    return Results.Ok(new { message = "Pairing revoked" });
+}).RequireRateLimiting("general");
+
+// ==================== Distributed admin toggle (phase 7a) ====================
+
+app.MapPost("/api/admin/distributed/enable", async (
+    DistributedConfigStore configStore, TlsCertificateProvider tlsProvider,
+    IApiKeyRepository keyRepo, HttpContext httpContext, ILoggerFactory loggerFactory) =>
+{
+    var distLogger = loggerFactory.CreateLogger("AIMemory.Api.Distributed");
+    var cfg = configStore.Load();
+    var wasEnabled = cfg.Enabled;
+
+    cfg.Enabled = true;
+    if (string.IsNullOrWhiteSpace(cfg.BindAddress) || cfg.BindAddress == "127.0.0.1")
+        cfg.BindAddress = "0.0.0.0";
+
+    // Generate (or reuse) the cert so the fingerprint we return matches what Kestrel will
+    // present after restart. SAN includes loopback + the bind interface (when not wildcard).
+    var sanHosts = new List<string>();
+    if (cfg.BindAddress != "0.0.0.0" && cfg.BindAddress != "::")
+        sanHosts.Add(cfg.BindAddress);
+    var cert = tlsProvider.GetOrCreate(sanHosts);
+    cfg.TlsFingerprint = CertFingerprint.Compute(cert);
+    configStore.Save(cfg);
+
+    // Issue a fresh ingest-scoped key. One-time reveal — primary stores only the SHA-256.
+    var rawKey = "aimemory_" + Convert.ToHexStringLower(
+        System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+    var keyHash = Convert.ToHexStringLower(
+        System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(rawKey)));
+
+    await keyRepo.CreateAsync(new ApiKey
+    {
+        Name = $"distributed-ingest-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}",
+        KeyHash = keyHash,
+        KeyPrefix = rawKey[8..16],
+        Scopes = ["ingest"],
+        IsActive = true,
+        CreatedBy = httpContext.User.Identity?.Name ?? "admin/distributed/enable"
+    });
+
+    distLogger.LogInformation("Distributed mode enabled (was: {Was}) — bind {Bind}, fingerprint {Fingerprint}",
+        wasEnabled, cfg.BindAddress, cfg.TlsFingerprint);
+
+    var endpoint = $"https://{cfg.BindAddress}:{cfg.BindPort}";
+    return Results.Ok(new DistributedEnableResponse
+    {
+        Endpoint = endpoint,
+        Fingerprint = cfg.TlsFingerprint,
+        ApiKey = rawKey,
+        // Persisted state changes take effect on the next service start. The desktop wizard
+        // is responsible for triggering the restart via the Tauri service control layer.
+        RestartRequired = !wasEnabled
+    });
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/admin/distributed/disable", (
+    DistributedConfigStore configStore, ILoggerFactory loggerFactory) =>
+{
+    var distLogger = loggerFactory.CreateLogger("AIMemory.Api.Distributed");
+    var cfg = configStore.Load();
+    var wasEnabled = cfg.Enabled;
+    cfg.Enabled = false;
+    cfg.BindAddress = "127.0.0.1";
+    // Keep the fingerprint cached so we can restore it without regenerating if the user
+    // re-enables; clearing it would force a re-pair on every secondary, which is a sharp
+    // edge for a soft toggle. Existing pairings remain in the DB but are unreachable
+    // until the listener rebinds.
+    configStore.Save(cfg);
+
+    distLogger.LogInformation("Distributed mode disabled (was: {Was})", wasEnabled);
+    return Results.Ok(new { message = "Distributed mode disabled. Restart the service to apply.", restartRequired = wasEnabled });
+}).RequireRateLimiting("general");
+
+app.MapGet("/api/admin/distributed/status", async (
+    DistributedConfigStore configStore, IPairingRepository pairingRepo) =>
+{
+    var cfg = configStore.Load();
+    var pairings = await pairingRepo.ListAsync(includeRevoked: false);
+    return Results.Ok(new DistributedStatusResponse
+    {
+        Enabled = cfg.Enabled,
+        BindAddress = cfg.BindAddress,
+        BindPort = cfg.BindPort,
+        Endpoint = cfg.Enabled ? $"https://{cfg.BindAddress}:{cfg.BindPort}" : null,
+        Fingerprint = cfg.Enabled ? cfg.TlsFingerprint : null,
+        PairedHostCount = pairings.Count
+    });
+}).RequireRateLimiting("general");
+
 // ==================== Stats Endpoint ====================
 
 app.MapGet("/api/stats", async (AIMemoryDbContext db) =>
@@ -777,12 +1050,29 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
     ISessionRepository sessionRepo, IMessageRepository messageRepo,
     IToolCallRepository toolCallRepo, IArtifactRepository artifactRepo,
     IIngestionRepository ingestionRepo, ICodeIndexRepository codeIndexRepo,
+    IHostRepository hostRepo,
     IHostIdProvider hostIdProvider, IProjectIdResolver projectIdResolver,
     ILoggerFactory loggerFactory) =>
 {
     var batchLogger = loggerFactory.CreateLogger("AIMemory.Api.Ingest");
-    batchLogger.LogInformation("Batch received: {Count} events from client={ClientId} source={Source}",
-        request.Events.Count, request.ClientId, request.Source);
+    batchLogger.LogInformation("Batch received: {Count} events from client={ClientId} source={Source} host={HostId}",
+        request.Events.Count, request.ClientId, request.Source, request.HostId);
+
+    // Phase 7a: validate HostId against the hosts table when supplied. Empty/null is allowed
+    // (v1 single-machine ingest path) — those are treated as the local host below. A non-empty
+    // value that doesn't match any known host is rejected with 403 to prevent secondaries from
+    // claiming arbitrary host_id values for events they emit.
+    if (!string.IsNullOrEmpty(request.HostId))
+    {
+        var knownHost = await hostRepo.GetAsync(request.HostId);
+        if (knownHost == null)
+        {
+            batchLogger.LogWarning("Rejecting batch with unknown HostId {HostId}", request.HostId);
+            return Results.Json(
+                new { error = $"Unknown HostId: {request.HostId}. Pair this host with the primary first." },
+                statusCode: 403);
+        }
+    }
 
     var eventResults = new List<IngestEventResult>();
     var existingKeys = await ingestionRepo.FilterExistingKeysAsync(request.Events.Select(e => e.IdempotencyKey));

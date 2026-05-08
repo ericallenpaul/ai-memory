@@ -13,7 +13,7 @@ pub struct RuntimeConfig {
     #[serde(rename = "baseUrl")]
     pub base_url: String,
 
-    /// API key the frontend should send via `X-API-Key`. Generated on first start
+    /// API key the frontend should send via `X-AIMemory-Api-Key`. Generated on first start
     /// of the API service and persisted as a regular row in the api_keys table.
     #[serde(rename = "apiKey")]
     pub api_key: String,

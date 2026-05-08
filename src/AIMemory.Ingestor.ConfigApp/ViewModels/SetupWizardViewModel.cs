@@ -60,7 +60,7 @@ public partial class SetupWizardViewModel : ObservableObject
         {
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
             if (!string.IsNullOrEmpty(ApiKey))
-                client.DefaultRequestHeaders.Add("X-API-Key", ApiKey);
+                client.DefaultRequestHeaders.Add("X-AIMemory-Api-Key", ApiKey);
 
             var response = await client.GetAsync($"{ApiUrl.TrimEnd('/')}/health");
             ConnectionTestResult = response.IsSuccessStatusCode

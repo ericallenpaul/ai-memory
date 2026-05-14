@@ -131,13 +131,24 @@ builder.Services.AddSingleton<ISourceAdapter, CodeAdapter>();
 // Streaming SHA-256 hasher — used by CodeAdapter for content_sha256 derivation.
 builder.Services.AddSingleton<IFileHasher, StreamingFileHasher>();
 
-// Identity (host_id + project_id). InstallSaltStore is rooted at the platform default — the
-// API service generates the salt on first run; the ingestor is happy to read whatever it finds.
-// On a remote-only install where the API isn't present, the ingestor still has its own
-// per-machine salt (a fallback path under %ProgramData% / %APPDATA%).
-var saltDir = OperatingSystem.IsWindows()
-    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "AIMemory", "Ingestor")
-    : InstallSaltStore.GetDefaultDirectory();
+// Identity (host_id + project_id). Single-machine installs share the salt with the API so
+// both services compute the same host_id. We prefer the API's directory when its salt file
+// is present; otherwise we fall back to the ingestor-local directory (the remote-only /
+// secondary-host shape, where the API service isn't installed on this machine).
+string saltDir;
+if (OperatingSystem.IsWindows())
+{
+    var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+    var apiSaltDir = Path.Combine(programData, "AIMemory", "Api");
+    var ingestorSaltDir = Path.Combine(programData, "AIMemory", "Ingestor");
+    saltDir = File.Exists(Path.Combine(apiSaltDir, "install-salt.bin"))
+        ? apiSaltDir
+        : ingestorSaltDir;
+}
+else
+{
+    saltDir = InstallSaltStore.GetDefaultDirectory();
+}
 Directory.CreateDirectory(saltDir);
 builder.Services.AddSingleton<IInstallSaltStore>(_ => new InstallSaltStore(saltDir));
 builder.Services.AddSingleton<IHostIdProvider, HostIdProvider>();

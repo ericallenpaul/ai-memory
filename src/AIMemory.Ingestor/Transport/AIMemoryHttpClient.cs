@@ -21,7 +21,7 @@ public class AIMemoryHttpClient : IAIMemoryClient
         {
             _logger.LogInformation("Sending batch of {Count} events to AIMemory API", request.Events.Count);
 
-            var response = await _httpClient.PostAsJsonAsync("/ingest/batch", request, cancellationToken);
+            var response = await _httpClient.PostAsJsonAsync("/api/ingest/batch", request, cancellationToken);
             response.EnsureSuccessStatusCode();
 
             var result = await response.Content.ReadFromJsonAsync<BatchIngestResponse>(cancellationToken);

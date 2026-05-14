@@ -303,6 +303,21 @@ using (var scope = app.Services.CreateScope())
         // Phase 6 post-migrate: canonicalize fallback project ids to git ids when possible.
         var legacyMigrator = scope.ServiceProvider.GetRequiredService<LegacyProjectMigrator>();
         await legacyMigrator.RunIfPendingAsync();
+
+        // Self-register the local host. The ingest batch validator (POST /api/ingest/batch)
+        // rejects unknown HostIds; without this row, a freshly-installed primary couldn't
+        // accept events from its own loopback ingestor. Idempotent via UpsertAsync.
+        var hostIdProvider = scope.ServiceProvider.GetRequiredService<IHostIdProvider>();
+        var hostRepo = scope.ServiceProvider.GetRequiredService<IHostRepository>();
+        var localHostId = hostIdProvider.GetHostId();
+        await hostRepo.UpsertAsync(new AIMemory.Models.Entities.Host
+        {
+            HostId = localHostId,
+            FriendlyName = Environment.MachineName,
+            OsKind = OperatingSystem.IsWindows() ? "windows" : OperatingSystem.IsLinux() ? "linux" : "macos",
+            IsLocal = true,
+        });
+        startupLogger.Info("Local host registered: {HostId} ({MachineName})", localHostId, Environment.MachineName);
     }
     catch (Exception ex)
     {
@@ -1206,10 +1221,15 @@ app.MapPost("/api/ingest/batch", async (BatchIngestRequest request, AIMemoryDbCo
 
     var eventResults = new List<IngestEventResult>();
     var existingKeys = await ingestionRepo.FilterExistingKeysAsync(request.Events.Select(e => e.IdempotencyKey));
+    // Also dedupe within the incoming batch — two events with the same key in a single payload
+    // both pass the DB-side existingKeys check (neither's in the DB yet) and would race to
+    // insert IngestionLogEntry rows, which trips EF's "already tracked" guard and poisons the
+    // DbContext for the rest of the batch.
+    var seenInBatch = new HashSet<string>(StringComparer.Ordinal);
 
     foreach (var evt in request.Events)
     {
-        if (existingKeys.Contains(evt.IdempotencyKey))
+        if (existingKeys.Contains(evt.IdempotencyKey) || !seenInBatch.Add(evt.IdempotencyKey))
         {
             eventResults.Add(new IngestEventResult
             {

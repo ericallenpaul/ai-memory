@@ -1,8 +1,15 @@
 # Distributed Ingestion Design
 
-> **Status:** Design — not implemented. Drafted 2026-05-08 to lock the schema and wire
-> protocol before phase 6 begins. All decisions in the "Decisions already locked" section
-> of the brief are treated as inputs to this document, not options to revisit.
+> **Status:** Design — shipped in phases 6–11. Drafted 2026-05-08 to lock the schema and
+> wire protocol before implementation. All decisions in the "Decisions already locked"
+> section of the brief were treated as inputs to this document.
+>
+> **Phase 12 update:** the desktop control surface moved off Tauri to a Kestrel-served
+> React SPA at `src/aimemory.client/`. Every Tauri/`apps/desktop` reference below has a
+> direct equivalent in the post-12 codebase — the API endpoints are unchanged, the admin
+> calls go through `src/aimemory.client/src/api/admin.ts` instead of Rust `invoke` shims,
+> and service control is exposed as `/api/admin/services/*` instead of Tauri commands.
+> The schema, threat model, and wire protocol are untouched.
 
 ai-memory currently runs as a single-machine bundle: `aimemory-api` and `aimemory-ingestor`
 Windows Services on the same box, both writing to one SQLite DB. Distributed mode adds a

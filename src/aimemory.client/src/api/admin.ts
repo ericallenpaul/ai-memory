@@ -1,8 +1,7 @@
 /**
- * Admin API helpers — replaces the Tauri shell's distributed/services/network-interface/
- * folder-picker invokes with same-origin fetch calls. Cookie auth is carried by the API
- * helper provided through ApiProvider; these helpers are pure type wrappers so callers
- * never have to remember the path shape.
+ * Admin API helpers — typed wrappers for /api/admin/* and /api/pairings/*. Cookie auth is
+ * carried by the API helper provided through ApiProvider; these helpers are pure type
+ * wrappers so callers never have to remember the path shape.
  */
 
 /* -------------------- Distributed-mode admin -------------------- */
@@ -84,8 +83,7 @@ export function listNetworkInterfaces(api: Fetcher): Promise<NetworkInterface[]>
 
 /**
  * Format a lowercase-hex SHA-256 fingerprint as colon-separated uppercase byte pairs.
- * Carried over from apps/desktop/src/api/distributed.ts so the Distributed page renders
- * identical text without further surgery.
+ * Wire/storage form stays lowercase hex (design §3.6); this is for UI display only.
  */
 export function formatFingerprint(hex: string): string {
   if (!hex) return "";

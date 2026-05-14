@@ -1,12 +1,9 @@
 # AIMemory.Ingestor.ConfigApp (RETIRED)
 
-> **Status:** Retired as of 2026-05-03. Superseded by `apps/desktop/` (Tauri shell).
+> **Status:** Retired as of 2026-05-03. Phase 12 (2026-05-14) replaced the Tauri shell that
+> superseded this project with a Kestrel-served web UI at `src/aimemory.client/`. Configuration
+> and service control are now in that web UI; ingestor pairing on secondary hosts uses the
+> headless CLI wizard.
 >
-> The Tauri desktop app provides cross-platform ingestor configuration and service control.
-> This project is kept buildable as a reference and Windows-only fallback, but no new features
-> will be added here. Bug fixes will be considered case-by-case.
-
-This project is a WPF (Windows-only) configuration utility for the AIMemory Ingestor service.
-Future development of the configuration surface lives in `apps/desktop/` instead.
-
-See `.claude/memory-bank/main/plans/main-2026-05-03-tauri-code-indexer.md` for the migration plan.
+> This WPF utility is kept buildable as a reference and Windows-only fallback. No new features
+> will be added here.

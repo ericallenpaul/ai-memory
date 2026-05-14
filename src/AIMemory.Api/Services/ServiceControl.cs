@@ -14,8 +14,7 @@ public sealed record ServiceOperationResult(bool Success, string? Error);
 /// <summary>
 /// Cross-platform service control. Windows uses <c>sc.exe</c> via process invocation
 /// (no extra NuGet dependency); Linux/macOS are unsupported until a systemd shell-out
-/// is wired in. The Tauri shell that this replaces was Windows-only for the same reasons
-/// — services.rs in apps/desktop/src-tauri had matching stub returns on non-Windows.
+/// is wired in.
 ///
 /// Only a fixed whitelist of service names is accepted (<c>aimemory-api</c>,
 /// <c>aimemory-ingestor</c>) so the endpoint can't be abused to start/stop arbitrary
@@ -67,7 +66,7 @@ public sealed class ServiceControl
             return stop;
         }
 
-        // SCM transitions through STOP_PENDING; matches Tauri's 1500ms pause.
+        // SCM transitions through STOP_PENDING — wait long enough to clear most Kestrel teardowns.
         await Task.Delay(TimeSpan.FromMilliseconds(1500), ct);
 
         return await ScCommandAsync("start", name, ct);

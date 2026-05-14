@@ -1,7 +1,6 @@
 # Distributed mode guide
 
-ai-memory's default deployment is single-machine: the desktop shell, the API
-service, and the ingestor all run on one box, writing to a single SQLite
+ai-memory's default deployment is single-machine: the web UI, the API service, and the ingestor all run on one box, writing to a single SQLite
 database. Distributed mode adds a second deployment shape — a remote machine
 that runs only the ingestor and forwards code-index events over the LAN to a
 primary AIMemory server.
@@ -40,7 +39,7 @@ full install.
 The NSIS installer (`AIMemory Desktop_<ver>_x64-setup.exe`) opens with a
 "Setup Type" page and offers two choices:
 
-- **Full install** *(default)* — installs the desktop dashboard plus both
+- **Full install** *(default)* — installs the web UI plus both
   Windows services (`aimemory-api`, `aimemory-ingestor`). This is the existing
   single-machine experience. The primary in a distributed setup is a full
   install with remote ingestors enabled.
@@ -50,8 +49,8 @@ The NSIS installer (`AIMemory Desktop_<ver>_x64-setup.exe`) opens with a
 
 The same installer ships both modes; the choice is persisted in
 `HKLM\Software\AIMemory\InstallMode` and a marker file at
-`%ProgramData%\AIMemory\app-mode.json`. The Tauri shell reads the marker on
-launch and renders the dashboard or the wizard accordingly.
+`%ProgramData%\AIMemory\app-mode.json`. Full installs serve the web UI from
+Kestrel; Ingestor-only installs use the phase-9 headless CLI wizard to pair on first launch.
 
 Switching modes after install is not supported in v1 — uninstall and reinstall
 with the other choice.
@@ -67,14 +66,15 @@ into the wizard, pair.
 
 On the machine that will hold the canonical database:
 
-1. Make sure you have a working full install. The desktop should open, and
-   `Services` should show `aimemory-api` and `aimemory-ingestor` running.
-2. Open the desktop, navigate to the **Distributed** page in the sidebar.
+1. Make sure you have a working full install. The browser should open the web UI,
+   and the **Services** page should show `aimemory-api` and `aimemory-ingestor` running.
+2. Navigate to the **Distributed** page in the sidebar.
 3. Click **Allow remote ingestors**. A confirm dialog appears with a bind
    interface picker.
 4. Pick the LAN interface you want the API to listen on:
-   - The dropdown is populated by Rust's network-interface enumerator.
-     Pick the entry whose IP is reachable from the secondary.
+   - The dropdown is populated by `GET /api/admin/network-interfaces`
+     (.NET `NetworkInformation` enumeration). Pick the entry whose IP is
+     reachable from the secondary.
    - `Any (0.0.0.0)` binds to all interfaces. Use this if the machine has
      more than one network and you want both reachable.
    - **Custom** lets you type an IPv4 explicitly. Loopback addresses
@@ -93,8 +93,9 @@ On the machine that will hold the canonical database:
      characters. Click the copy icon to grab it.
    - `Cert fingerprint` — formatted in `AA:BB:CC:...` style for readability.
 7. Click **Restart API service** when prompted. The bind interface change
-   needs a service restart to take effect; the desktop's existing service
-   control (`services.rs`) handles this through the Windows SCM.
+   needs a service restart to take effect; the web UI calls
+   `POST /api/admin/services/aimemory-api/restart`, which shells out to
+   `sc.exe` from the API service itself (running as LocalSystem).
 
 The reveal panel disappears once you dismiss it. The API key is stored as a
 SHA-256 hash on disk — there is no way to view it again. If you lose it,
@@ -105,47 +106,47 @@ secondary.
 
 On the machine that will push events:
 
-1. Run the same installer (`AIMemory Desktop_<ver>_x64-setup.exe`).
+1. Run the same installer (`AIMemory_<ver>_x64-setup.exe`).
 2. On the **Setup Type** page, pick **Ingestor-only (Remote node)**.
 3. Continue through the wizard. The installer:
    - Registers `aimemory-ingestor` as a Windows Service with start type
      Automatic. **It does not start the service yet** — pairing has to come
      first.
-   - Skips registering `aimemory-api` and prunes `AIMemory.Api.*` from
-     `$INSTDIR\resources\api\`.
-   - Writes `%ProgramData%\AIMemory\app-mode.json` with `{"mode":
-     "ingestor-only"}`.
-   - Replaces the Start Menu shortcut with **AIMemory Ingestor Setup**.
-4. Open **AIMemory Ingestor Setup** from the Start Menu (or wait for it to
-   open at the end of install).
+   - Skips registering `aimemory-api` and prunes the API binaries.
+   - Drops a Start Menu shortcut to **AIMemory Pair Ingestor** that launches
+     the headless CLI wizard.
+4. Open **AIMemory Pair Ingestor** from the Start Menu (or run
+   `AIMemory.Ingestor.exe --pair` from an elevated terminal).
 
-The Tauri shell reads `app-mode.json` and renders the wizard, not the full
-dashboard.
+There is no local web UI on secondaries. All pairing is done through the
+headless wizard, which writes the same config that the pre-phase-12 wizard did.
 
 ### 3. Pair with the primary
 
-1. The wizard pre-populates the **Host ID** field by shelling out to
-   `AIMemory.Ingestor.exe --print-host-id`. This is the SHA-256 of the
-   machine GUID plus the install salt — stable across reboots, changes on
-   reimage. You can't edit it.
-2. Paste the three values from the primary's Distributed page:
+The headless wizard prompts for input on the console:
+
+1. The wizard prints the **Host ID** at the top — the SHA-256 of the
+   machine GUID plus the install salt, stable across reboots and changes
+   on reimage.
+2. Enter the three values from the primary's Distributed page:
    - **Endpoint** — the `https://<ip>:<port>` URL.
-   - **API key** — the `aimemory_...` string. The field hides input by
-     default; toggle visibility if you want to verify before pasting.
+   - **API key** — the `aimemory_...` string. Input is masked by default;
+     pass `--show-key` to disable masking if you want to verify on paste.
    - **Cert fingerprint** — paste either the colon-separated form or plain
      hex. The wizard normalizes both.
-3. Optionally set a **Friendly name**. Defaults to the machine's hostname.
+3. Optionally enter a **Friendly name**. Defaults to the machine's hostname.
    Must be unique across the primary's pairing list (collisions are
    rejected with HTTP 409).
-4. Click **Test connection**. The wizard:
-   - Opens a raw rustls TLS connection to the endpoint, captures the leaf
-     cert, and computes its SHA-256. If that doesn't match the pasted
-     fingerprint, the connection aborts before any HTTP request goes out.
+4. The wizard **tests the connection**:
+   - Opens a TLS connection to the endpoint with .NET's
+     `RemoteCertificateValidationCallback`, captures the leaf cert, and
+     computes its SHA-256. If that doesn't match the pasted fingerprint,
+     the connection aborts before any HTTP request goes out.
    - Sends `GET /api/health` with the API key in the
      `X-AIMemory-Api-Key` header. A 200 means TLS pin and auth both passed.
-5. Click **Pair**. The wizard runs the same handshake again, then sends
-   `POST /api/pairings` with the host ID, friendly name, OS kind, and
-   ingestor version. On success the primary returns a `pairingId`.
+5. On success, the wizard sends `POST /api/pairings` with the host ID,
+   friendly name, OS kind, and ingestor version. The primary returns a
+   `pairingId`.
 6. The wizard writes
    `%ProgramData%\AIMemory\Ingestor\appsettings.json`:
 
@@ -162,11 +163,10 @@ dashboard.
    }
    ```
 
-7. The wizard navigates to the status page. Start the ingestor service
-   (`sc.exe start aimemory-ingestor` from an elevated prompt, or use the
-   **Start service** button on the status page). On startup, the ingestor's
-   `IngestorConfigValidator` checks all three Remote fields; any missing or
-   malformed value fails fast with a clear log message.
+7. Start the ingestor service (`sc.exe start aimemory-ingestor` from an
+   elevated prompt). On startup, the ingestor's `IngestorConfigValidator`
+   checks all three Remote fields; any missing or malformed value fails
+   fast with a clear log message.
 
 ### 4. Verify ingestion is flowing
 
@@ -287,31 +287,34 @@ api-key cache expires. Re-pair from the secondary's status page using the
 
 ### The built `setup.exe` is empty or missing the API binary
 
-Phase 11's bundle layout copies the .NET binaries into
-`apps/desktop/src-tauri/bundle-resources/{api,ingestor}/` before `tauri
-build` runs. The `prepublish:dotnet` script does that publish; `tauri.conf.json`
-chains it via `beforeBuildCommand`. If the chain failed silently and you got
-a small (~3 MB) installer, run the publish manually and check the output:
+Phase 12's installer builds publish trees for both services and the SPA
+under `scripts/installer/staging/` before NSIS packages them. The
+`scripts/installer/build-installer.ps1` script does this in one step. If
+the staging dir is missing files (e.g. `AIMemory.Api.exe` absent or the
+SPA's `index.html` not under `wwwroot/`), check that:
 
 ```powershell
-cd apps/desktop
-npm run prepublish:dotnet
+# Publish API + Ingestor framework-dependent single-file binaries
+dotnet publish src/AIMemory.Api/AIMemory.Api.csproj -c Release
+dotnet publish src/AIMemory.Ingestor/AIMemory.Ingestor.csproj -c Release
+
+# Build the SPA into wwwroot
+cd src/aimemory.client
+npm install
+npm run build
 ```
 
-The expected output is two trees under `src-tauri/bundle-resources/`:
-- `api/AIMemory.Api.exe` (~32 MB framework-dependent single-file)
-- `ingestor/AIMemory.Ingestor.exe` (~33 MB)
+The installer staging should end up with `AIMemory.Api.exe` (~32 MB
+framework-dependent single-file), `AIMemory.Ingestor.exe` (~33 MB),
+`AIMemory.Mcp.exe`, `appsettings.json`, `nlog.config`, `wwwroot/`,
+`e_sqlite3.dll`, and `git2-*.dll`. Re-run `build-installer.ps1` after a
+clean publish.
 
-Both directories also contain `appsettings.json`, `nlog.config`,
-`web.config`, `wwwroot/`, `e_sqlite3.dll`, and `git2-*.dll`. After a clean
-publish, re-run `npm run tauri build` (under vcvars64 — see the desktop
-README).
+### The headless wizard reports "could not read host ID"
 
-### The wizard reports "could not read host ID"
-
-The wizard shells out to `AIMemory.Ingestor.exe --print-host-id`. If the
-ingestor binary isn't in the install dir (e.g. mid-install, or a partially
-failed install), the flag won't resolve. Re-run the installer and pick
+The wizard reads the host ID via the ingestor's own `IHostIdProvider`. If
+the ingestor binary isn't in the install dir (e.g. mid-install, or a
+partially failed install), the wizard won't start. Re-run the installer and pick
 **Repair**.
 
 ---

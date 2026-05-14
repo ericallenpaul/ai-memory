@@ -70,3 +70,7 @@ secrets.json
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Installer build artifacts
+scripts/installer/staging/
+scripts/installer/out/

@@ -237,6 +237,10 @@ var configDirCapture = programDataConfigDir;
 builder.Services.AddSingleton(sp => new DistributedConfigStore(configDirCapture));
 builder.Services.AddSingleton(sp => new TlsCertificateProvider(configDirCapture));
 
+// Service control — replaces the Tauri shell's SCM access. Endpoints under /api/admin/services/*
+// inherit admin-scope auth from ApiKeyAuthMiddleware's path mapping.
+builder.Services.AddSingleton<AIMemory.Api.Services.ServiceControl>();
+
 // Code Index services
 builder.Services.AddSingleton<FileFilter>();
 builder.Services.AddSingleton<ILanguageParser, CSharpParser>();
@@ -796,6 +800,105 @@ app.MapGet("/api/admin/distributed/status", async (
         Endpoint = cfg.Enabled ? $"https://{cfg.BindAddress}:{cfg.BindPort}" : null,
         Fingerprint = cfg.Enabled ? cfg.TlsFingerprint : null,
         PairedHostCount = pairings.Count
+    });
+}).RequireRateLimiting("general");
+
+// ==================== Service Control (post-Tauri replacement for the SCM surface) ====================
+//
+// Replaces the Tauri shell's service_status/start/stop/restart commands. The API service runs as
+// LocalSystem on Windows (per the installer in phase 10) so it has the SCM access required to
+// control aimemory-api and aimemory-ingestor without a separate elevation step.
+
+app.MapGet("/api/admin/services/{name}/status", async (
+    string name, AIMemory.Api.Services.ServiceControl svc, CancellationToken ct) =>
+{
+    if (!svc.IsAllowed(name)) return Results.NotFound(new { error = $"Unknown service '{name}'" });
+    var status = await svc.GetStatusAsync(name, ct);
+    return Results.Ok(status);
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/admin/services/{name}/start", async (
+    string name, AIMemory.Api.Services.ServiceControl svc, CancellationToken ct) =>
+{
+    if (!svc.IsAllowed(name)) return Results.NotFound(new { error = $"Unknown service '{name}'" });
+    var result = await svc.StartAsync(name, ct);
+    return result.Success ? Results.NoContent() : Results.Problem(result.Error, statusCode: 500);
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/admin/services/{name}/stop", async (
+    string name, AIMemory.Api.Services.ServiceControl svc, CancellationToken ct) =>
+{
+    if (!svc.IsAllowed(name)) return Results.NotFound(new { error = $"Unknown service '{name}'" });
+    var result = await svc.StopAsync(name, ct);
+    return result.Success ? Results.NoContent() : Results.Problem(result.Error, statusCode: 500);
+}).RequireRateLimiting("general");
+
+app.MapPost("/api/admin/services/{name}/restart", async (
+    string name, AIMemory.Api.Services.ServiceControl svc, CancellationToken ct) =>
+{
+    if (!svc.IsAllowed(name)) return Results.NotFound(new { error = $"Unknown service '{name}'" });
+    var result = await svc.RestartAsync(name, ct);
+    return result.Success ? Results.NoContent() : Results.Problem(result.Error, statusCode: 500);
+}).RequireRateLimiting("general");
+
+// ==================== Network interfaces (post-Tauri replacement for list_network_interfaces) ====================
+//
+// Suggests bind addresses for the Distributed enable flow. Always includes the wildcard
+// (0.0.0.0) plus any up, non-loopback IPv4 unicast addresses. The picker treats the list as
+// suggestions — the user can type any IPv4 and BindInterfaceValidator decides if it's accepted.
+app.MapGet("/api/admin/network-interfaces", () =>
+{
+    var results = new List<object>
+    {
+        new { name = "Any (0.0.0.0)", address = "0.0.0.0" }
+    };
+
+    try
+    {
+        foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+            if (nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+
+            foreach (var addr in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (addr.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) continue;
+                if (IPAddress.IsLoopback(addr.Address)) continue;
+                results.Add(new { name = $"{nic.Name} ({addr.Address})", address = addr.Address.ToString() });
+            }
+        }
+    }
+    catch
+    {
+        // Best-effort: if enumeration fails we still return the wildcard so the UI picker isn't empty.
+    }
+
+    return Results.Ok(results);
+}).RequireRateLimiting("general");
+
+// ==================== Filesystem path validation (post-Tauri replacement for pick_folder) ====================
+//
+// Replaces the native folder picker with text-input + server-side validation. Web browsers can't
+// portably surface a directory picker (input[type=file] webkitdirectory uploads contents, doesn't
+// return a path), so the Repos add-repo flow now takes a typed path and validates it here.
+app.MapPost("/api/admin/fs/validate-path", (ValidatePathRequest request) =>
+{
+    if (request is null || string.IsNullOrWhiteSpace(request.Path))
+        return Results.BadRequest(new { error = "path is required" });
+
+    string fullPath;
+    try { fullPath = Path.GetFullPath(request.Path); }
+    catch (Exception ex) { return Results.BadRequest(new { error = $"invalid path: {ex.Message}" }); }
+
+    var exists = Directory.Exists(fullPath);
+    var isGitRepo = exists && (Directory.Exists(Path.Combine(fullPath, ".git"))
+                              || File.Exists(Path.Combine(fullPath, ".git"))); // worktrees use a file
+    return Results.Ok(new
+    {
+        path = fullPath,
+        exists,
+        isDirectory = exists,
+        isGitRepo
     });
 }).RequireRateLimiting("general");
 

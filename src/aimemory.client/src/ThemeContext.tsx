@@ -12,8 +12,10 @@ const ThemeContext = createContext<ThemeContextValue | null>(null)
 function getInitialTheme(): Theme {
   const stored = localStorage.getItem('aimemory-theme')
   if (stored === 'light' || stored === 'dark') return stored
-  if (window.matchMedia('(prefers-color-scheme: light)').matches) return 'light'
-  return 'dark'
+  // Per DESIGN.md the product reads as a daylight dashboard by default; we only
+  // flip to dark when the OS explicitly prefers it.
+  if (window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark'
+  return 'light'
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {

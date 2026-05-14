@@ -1,50 +1,137 @@
 /* ============================================================
-   AIMemory Global Styles — Theme-aware
+   AIMemory Global Styles — DESIGN.md system
+   Light theme is default; dark theme via [data-theme="dark"].
    ============================================================ */
 
-/* --- CSS Custom Properties --------------------------------- */
-:root {
-  --color-bg-deep: #0f172a;
-  --color-bg-card: #1e293b;
-  --color-bg-elevated: #334155;
-  --color-border-default: #334155;
-  --color-border-subtle: #1e293b;
-  --color-text-primary: #f1f5f9;
-  --color-text-secondary: #e2e8f0;
-  --color-text-muted: #94a3b8;
-  --color-text-dim: #64748b;
-  --color-text-body: #cbd5e1;
-  --color-accent: #3b82f6;
-  --color-placeholder: #475569;
-  --color-scrollbar-track: #0f172a;
-  --color-scrollbar-thumb: #334155;
-  --color-scrollbar-thumb-hover: #475569;
-  --color-spinner-ring: #334155;
-}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-[data-theme="light"] {
-  --color-bg-deep: #ffffff;
-  --color-bg-card: #fcfdfd;
-  --color-bg-elevated: #e2e8f0;
-  --color-border-default: #cbd5e1;
-  --color-border-subtle: #e2e8f0;
-  --color-text-primary: #0f172a;
-  --color-text-secondary: #1e293b;
-  --color-text-muted: #64748b;
-  --color-text-dim: #94a3b8;
-  --color-text-body: #334155;
-  --color-accent: #3b82f6;
-  --color-placeholder: #94a3b8;
-  --color-scrollbar-track: #f1f5f9;
+/* --- Design tokens — light (default) ------------------------ */
+:root {
+  /* Surfaces */
+  --surface-canvas: #f8fafc;       /* app background */
+  --surface: #ffffff;              /* card surface */
+  --surface-elevated: #f1f5f9;     /* sidebar, hover */
+  --surface-pressed: #e2e8f0;
+  --surface-tint: rgba(37, 99, 235, 0.06);
+  --surface-tint-strong: rgba(37, 99, 235, 0.12);
+
+  /* Borders */
+  --border: #e2e8f0;
+  --border-subtle: #f1f5f9;
+  --border-strong: #cbd5e1;
+
+  /* Text */
+  --text-heading: #0f172a;         /* Deep Navy */
+  --text-body: #334155;
+  --text-muted: #64748b;           /* Slate Gray */
+  --text-dim: #94a3b8;
+  --text-inverse: #ffffff;
+
+  /* Primary action */
+  --primary: #2563eb;              /* Vibrant Blue */
+  --primary-hover: #1d4ed8;
+  --primary-pressed: #1e40af;
+  --primary-soft: rgba(37, 99, 235, 0.1);
+  --primary-ring: rgba(37, 99, 235, 0.2);
+  --on-primary: #ffffff;
+
+  /* Status (desaturated tints) */
+  --success: #059669;
+  --success-soft: rgba(5, 150, 105, 0.12);
+  --warning: #d97706;
+  --warning-soft: rgba(217, 119, 6, 0.12);
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.1);
+  --info: #0284c7;
+  --info-soft: rgba(2, 132, 199, 0.1);
+
+  /* Radii */
+  --radius-sm: 0.25rem;
+  --radius: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-card: 12px;
+  --radius-full: 9999px;
+
+  /* Spacing */
+  --gutter: 24px;
+  --card-padding: 24px;
+  --sidebar-width: 260px;
+
+  /* Elevation */
+  --shadow-hover: 0 4px 12px rgba(15, 23, 42, 0.05);
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.03);
+
+  /* Legacy aliases — keep until every page is migrated. */
+  --color-bg-deep: var(--surface-canvas);
+  --color-bg-card: var(--surface);
+  --color-bg-elevated: var(--surface-elevated);
+  --color-border-default: var(--border);
+  --color-border-subtle: var(--border-subtle);
+  --color-text-primary: var(--text-heading);
+  --color-text-secondary: var(--text-body);
+  --color-text-body: var(--text-body);
+  --color-text-muted: var(--text-muted);
+  --color-text-dim: var(--text-dim);
+  --color-accent: var(--primary);
+  --color-placeholder: var(--text-dim);
+  --color-scrollbar-track: var(--surface-elevated);
   --color-scrollbar-thumb: #cbd5e1;
   --color-scrollbar-thumb-hover: #94a3b8;
-  --color-spinner-ring: #cbd5e1;
+  --color-spinner-ring: var(--border);
+
+  /* admin.css legacy aliases */
+  --bg: var(--surface-canvas);
+  --bg-2: var(--surface-elevated);
+  --text: var(--text-heading);
+  --text-dim: var(--text-muted);
+  --accent: var(--primary);
+  --accent-hover: var(--primary-hover);
 }
 
-/* --- Reset & Base ------------------------------------------ */
-*,
-*::before,
-*::after {
+/* --- Design tokens — dark ----------------------------------- */
+[data-theme="dark"] {
+  --surface-canvas: #0f172a;
+  --surface: #1e293b;
+  --surface-elevated: #0b1426;
+  --surface-pressed: #334155;
+  --surface-tint: rgba(59, 130, 246, 0.08);
+  --surface-tint-strong: rgba(59, 130, 246, 0.18);
+
+  --border: #334155;
+  --border-subtle: #1e293b;
+  --border-strong: #475569;
+
+  --text-heading: #f1f5f9;
+  --text-body: #cbd5e1;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  --text-inverse: #0f172a;
+
+  --primary: #3b82f6;
+  --primary-hover: #60a5fa;
+  --primary-pressed: #2563eb;
+  --primary-soft: rgba(59, 130, 246, 0.16);
+  --primary-ring: rgba(59, 130, 246, 0.3);
+
+  --success: #10b981;
+  --success-soft: rgba(16, 185, 129, 0.16);
+  --warning: #f59e0b;
+  --warning-soft: rgba(245, 158, 11, 0.16);
+  --danger: #ef4444;
+  --danger-soft: rgba(239, 68, 68, 0.16);
+  --info: #38bdf8;
+  --info-soft: rgba(56, 189, 248, 0.16);
+
+  --shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.3);
+  --shadow-card: none;
+
+  --color-scrollbar-thumb: #475569;
+  --color-scrollbar-thumb-hover: #64748b;
+}
+
+/* --- Reset & base ------------------------------------------- */
+*, *::before, *::after {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
@@ -56,167 +143,294 @@ html {
 }
 
 body {
-  background-color: var(--color-bg-deep);
-  color: var(--color-text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
-    Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: var(--surface-canvas);
+  color: var(--text-body);
   line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   min-height: 100vh;
 }
 
-#root {
-  min-height: 100vh;
+#root { min-height: 100vh; }
+
+*, *::before, *::after {
+  transition: background-color 180ms ease, color 180ms ease, border-color 180ms ease;
 }
 
-/* --- Smooth theme transition ------------------------------ */
-*,
-*::before,
-*::after {
-  transition: background-color 200ms ease, color 200ms ease, border-color 200ms ease;
-}
-
-/* --- Typography -------------------------------------------- */
+/* --- Typography --------------------------------------------- */
 h1, h2, h3, h4, h5, h6 {
+  font-family: 'Inter', sans-serif;
+  color: var(--text-heading);
+  line-height: 1.2;
+}
+
+h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
+h2 { font-size: 18px; font-weight: 600; }
+h3 { font-size: 16px; font-weight: 600; }
+
+a {
+  color: var(--primary);
+  text-decoration: none;
+}
+a:hover { text-decoration: underline; }
+
+.label {
+  font-size: 12px;
   font-weight: 600;
-  line-height: 1.25;
-  color: var(--color-text-primary);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
-a {
-  color: var(--color-accent);
-  text-decoration: none;
-}
-
-a:hover {
-  text-decoration: underline;
-}
-
-/* --- Interactive Element Transitions ----------------------- */
-button,
-input,
-select,
-textarea,
-a {
-  transition: background-color 200ms ease, color 200ms ease,
-    border-color 200ms ease, box-shadow 200ms ease, opacity 200ms ease,
-    filter 200ms ease;
-}
-
-/* --- Focus Visible ----------------------------------------- */
+/* --- Focus -------------------------------------------------- */
 :focus-visible {
-  outline: 2px solid var(--color-accent);
+  outline: 2px solid var(--primary);
   outline-offset: 2px;
+  border-radius: var(--radius);
 }
+:focus:not(:focus-visible) { outline: none; }
 
-/* Remove default focus ring in favour of :focus-visible */
-:focus:not(:focus-visible) {
-  outline: none;
-}
+/* --- Buttons (legacy class set used by ported admin pages) -- */
+button { cursor: pointer; font-family: inherit; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* --- Buttons ----------------------------------------------- */
-button {
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--primary);
+  color: var(--on-primary);
+  border: 1px solid var(--primary);
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: inherit;
   cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+.btn:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
+.btn:active:not(:disabled) { background: var(--primary-pressed); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.secondary {
+  background: var(--surface);
+  color: var(--text-heading);
+  border: 1px solid var(--border-strong);
+}
+.btn.secondary:hover:not(:disabled) {
+  background: var(--surface-elevated);
+  border-color: var(--text-muted);
+}
+.btn.ghost {
+  background: transparent;
+  color: var(--text-body);
+  border: 1px solid transparent;
+}
+.btn.ghost:hover:not(:disabled) {
+  background: var(--surface-elevated);
+}
+.btn.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #ffffff;
+}
+.btn.danger:hover:not(:disabled) {
+  background: #b91c1c;
+  border-color: #b91c1c;
 }
 
-button:hover:not(:disabled) {
-  filter: brightness(1.15);
+/* --- Card --------------------------------------------------- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: var(--card-padding);
+  margin-bottom: var(--gutter);
+  box-shadow: var(--shadow-card);
 }
-
-button:active:not(:disabled) {
-  filter: brightness(0.9);
+.card.flush { padding: 0; }
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 16px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border-subtle);
 }
+.card-header h2 { margin: 0; flex: 1; }
 
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+/* --- Tables ------------------------------------------------- */
+.card table { width: 100%; border-collapse: collapse; }
+.card table th,
+.card table td {
+  padding: 14px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 14px;
+  color: var(--text-body);
 }
-
-/* --- Nav Links --------------------------------------------- */
-.nav-link {
-  display: block;
-  padding: 0.625rem 0.75rem;
-  border-radius: 6px;
-  text-decoration: none;
-  font-size: 0.875rem;
-  margin-bottom: 2px;
-  color: var(--color-text-muted);
-  transition: background-color 200ms ease, color 200ms ease;
+.card table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
+.card table tr:last-child td { border-bottom: none; }
+.card table tr:hover td { background: var(--surface-elevated); }
 
-.nav-link:hover {
-  background-color: var(--color-bg-card);
-  color: var(--color-text-body);
-  text-decoration: none;
+/* --- Badge -------------------------------------------------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--surface-elevated);
+  color: var(--text-muted);
 }
-
-.nav-link.active {
-  background-color: var(--color-bg-card);
-  color: var(--color-text-primary);
-}
-
-/* --- Scrollbar Styling ------------------------------------- */
-::-webkit-scrollbar {
+.badge::before {
+  content: "";
   width: 6px;
   height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.badge.running, .badge.operational { background: var(--success-soft); color: var(--success); }
+.badge.stopped, .badge.notinstalled { background: var(--danger-soft); color: var(--danger); }
+.badge.pending, .badge.startpending, .badge.stoppending { background: var(--warning-soft); color: var(--warning); }
+.badge.unknown { background: var(--surface-elevated); color: var(--text-muted); }
+
+/* --- Inputs ------------------------------------------------- */
+input, textarea, select {
+  background: var(--surface);
+  color: var(--text-heading);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 14px;
+  font-family: inherit;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-ring);
+}
+input::placeholder, textarea::placeholder { color: var(--text-dim); }
+.admin-input { /* legacy alias used by ported admin pages */ }
+
+/* --- Toolbar / empty state / error banner ------------------- */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: var(--gutter);
 }
 
-::-webkit-scrollbar-track {
-  background: var(--color-scrollbar-track);
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--text-muted);
+}
+.empty-state .icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--surface-elevated);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+  color: var(--text-muted);
+}
+.empty-state .title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-heading);
+  margin-bottom: 6px;
+}
+.empty-state .description {
+  font-size: 14px;
+  color: var(--text-muted);
+  max-width: 360px;
+  margin-bottom: 16px;
 }
 
-::-webkit-scrollbar-thumb {
-  background: var(--color-scrollbar-thumb);
-  border-radius: 3px;
+.error-banner {
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-size: 14px;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: var(--color-scrollbar-thumb-hover);
+/* --- Nav links --------------------------------------------- */
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-body);
+  margin-bottom: 2px;
+}
+.nav-link:hover {
+  background: var(--surface);
+  color: var(--text-heading);
+  text-decoration: none;
+}
+.nav-link.active {
+  background: var(--surface);
+  color: var(--primary);
+  border: 1px solid var(--border);
+}
+.nav-group {
+  margin-top: 16px;
+  padding: 0 12px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
-/* Firefox */
+/* --- Scrollbar --------------------------------------------- */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-scrollbar-thumb); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-scrollbar-thumb-hover); }
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
+  scrollbar-color: var(--color-scrollbar-thumb) transparent;
 }
 
-/* --- Spinner Animation ------------------------------------- */
-@keyframes spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
+/* --- Spinner ----------------------------------------------- */
+@keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 .spinner {
   display: inline-block;
   border-radius: 50%;
   border-style: solid;
-  border-color: var(--color-spinner-ring);
-  border-top-color: var(--color-accent);
+  border-color: var(--border);
+  border-top-color: var(--primary);
   animation: spin 700ms linear infinite;
 }
 
-/* --- Inputs ------------------------------------------------ */
-input,
-textarea,
-select {
-  background-color: var(--color-bg-deep);
-  color: var(--color-text-primary);
-  border: 1px solid var(--color-border-default);
-  border-radius: 6px;
-}
-
-input:focus,
-textarea:focus,
-select:focus {
-  border-color: var(--color-accent);
-  outline: none;
-  box-shadow: 0 0 0 1px var(--color-accent);
-}
-
-input::placeholder,
-textarea::placeholder {
-  color: var(--color-placeholder);
+/* --- Mono / code ------------------------------------------- */
+.mono, code, pre {
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  font-size: 13px;
 }

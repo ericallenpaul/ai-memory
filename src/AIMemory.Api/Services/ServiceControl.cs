@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Runtime.Versioning;
+using System.Text.Json.Serialization;
 
 namespace AIMemory.Api.Services;
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum ServiceState { Running, Stopped, StartPending, StopPending, NotInstalled, Unknown }
 
 public sealed record ServiceStatus(string Name, ServiceState State, int? Pid, string? DisplayName);

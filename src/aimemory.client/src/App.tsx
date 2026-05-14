@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useEffect, useState } from 'react'
 import { getSetupStatus, getMe } from './api/client'
 import { useTheme } from './ThemeContext'
+import { ApiProvider } from './api/ApiContext'
 import Layout from './components/Layout'
 import SetupWizard from './pages/SetupWizard'
 import Login from './pages/Login'
@@ -11,6 +12,12 @@ import SessionDetail from './pages/SessionDetail'
 import Search from './pages/Search'
 import Logs from './pages/Logs'
 import ApiKeys from './pages/ApiKeys'
+import Repos from './pages/Repos'
+import RepoDetail from './pages/RepoDetail'
+import Services from './pages/Services'
+import Distributed from './pages/Distributed'
+import DbBrowser from './pages/DbBrowser'
+import Settings from './pages/Settings'
 import Logo from './components/Logo'
 import Spinner from './components/Spinner'
 
@@ -51,19 +58,27 @@ export default function App() {
   )
 
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route element={<Layout username={username} onLogout={() => setState('login')} />}>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/sessions" element={<Sessions />} />
-          <Route path="/sessions/:id" element={<SessionDetail />} />
-          <Route path="/search" element={<Search />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route path="/keys" element={<ApiKeys />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
+    <ApiProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route element={<Layout username={username} onLogout={() => setState('login')} />}>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/sessions" element={<Sessions />} />
+            <Route path="/sessions/:id" element={<SessionDetail />} />
+            <Route path="/search" element={<Search />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/keys" element={<ApiKeys />} />
+            <Route path="/repos" element={<Repos />} />
+            <Route path="/repos/:repoId" element={<RepoDetail />} />
+            <Route path="/services" element={<Services />} />
+            <Route path="/distributed" element={<Distributed />} />
+            <Route path="/db" element={<DbBrowser />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </ApiProvider>
   )
 }
 

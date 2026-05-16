@@ -1,12 +1,17 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Build the AIMemory NSIS installer.
+    Build the AIMemory NSIS installer(s).
 
 .DESCRIPTION
     Publishes API, Ingestor, and MCP as framework-dependent single-file binaries,
     builds the React SPA into wwwroot, stages everything under
-    scripts/installer/staging/, then runs makensis.exe to produce a setup.exe.
+    scripts/installer/staging/, then runs makensis.exe — by default once per
+    variant — to produce setup.exe files.
+
+    Default output:
+      out/AIMemory_<ver>_x64-setup.exe            (full: API + Ingestor + MCP + UI)
+      out/AIMemory-Ingestor_<ver>_x64-setup.exe   (ingestor-only: smaller payload)
 
 .PARAMETER Version
     Installer version label. Embedded in the .exe name, registry, and "Programs &
@@ -16,7 +21,7 @@
     dotnet publish configuration. Default: Release
 
 .PARAMETER OutputDir
-    Where to drop the final setup.exe. Default: scripts/installer/out
+    Where to drop the final setup.exe files. Default: scripts/installer/out
 
 .PARAMETER Makensis
     Path to makensis.exe. Default: searches PATH, then C:\Program Files\NSIS, then
@@ -26,17 +31,24 @@
     Skip the dotnet publish + npm build steps and use whatever's already staged.
     Useful for iterating on the .nsi script.
 
+.PARAMETER Variant
+    Which installer variant(s) to produce: 'full', 'ingestor', 'both' (default),
+    or 'legacy' (single installer with a runtime SetupType wizard page).
+
 .EXAMPLE
     pwsh scripts/installer/build-installer.ps1
     pwsh scripts/installer/build-installer.ps1 -Version 0.3.0 -OutputDir .\dist
+    pwsh scripts/installer/build-installer.ps1 -Variant ingestor -SkipPublish
 #>
 [CmdletBinding()]
 param(
-  [string]$Version = '0.2.0',
+  [string]$Version = '0.12.0',
   [string]$Configuration = 'Release',
   [string]$OutputDir,
   [string]$Makensis,
-  [switch]$SkipPublish
+  [switch]$SkipPublish,
+  [ValidateSet('both','full','ingestor','legacy')]
+  [string]$Variant = 'both'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,8 +69,15 @@ if (-not $Makensis) {
     'C:\Program Files (x86)\NSIS\makensis.exe'
   )
   foreach ($c in $candidates) {
-    $resolved = (Get-Command $c -ErrorAction SilentlyContinue).Source
-    if ($resolved) { $Makensis = $resolved; break }
+    $cmd = Get-Command $c -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+      $Makensis = $cmd.Source
+      break
+    }
+    if (Test-Path $c) {
+      $Makensis = $c
+      break
+    }
   }
 }
 if (-not $Makensis -or -not (Test-Path $Makensis)) {
@@ -136,20 +155,47 @@ Config: %ProgramData%\AIMemory\Api\, %ProgramData%\AIMemory\Ingestor\
 # ----------------------------- Run makensis ------------------------------
 
 $nsi = Join-Path $ScriptDir 'installer.nsi'
-$out = Join-Path $OutputDir "AIMemory_${Version}_x64-setup.exe"
 
-Write-Host ">>> Running makensis -> $out" -ForegroundColor Cyan
-& $Makensis `
-  "/DVERSION=$Version" `
-  "/DSTAGE_DIR=$StageDir" `
-  "/DOUTPUT_FILE=$out" `
-  $nsi
+# Variant -> (output filename, extra /D defines for makensis).
+# Empty modeDefine means "no compile-time mode" (legacy runtime SetupType page).
+$variants = @{
+  full     = @{ FileName = "AIMemory_${Version}_x64-setup.exe";          ModeDefine = '/DMODE_FULL=1' }
+  ingestor = @{ FileName = "AIMemory-Ingestor_${Version}_x64-setup.exe"; ModeDefine = '/DMODE_INGESTOR_ONLY=1' }
+  legacy   = @{ FileName = "AIMemory-Combined_${Version}_x64-setup.exe"; ModeDefine = '' }
+}
 
-if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+switch ($Variant) {
+  'both'     { $toBuild = @('full','ingestor') }
+  'full'     { $toBuild = @('full') }
+  'ingestor' { $toBuild = @('ingestor') }
+  'legacy'   { $toBuild = @('legacy') }
+}
 
-if (Test-Path $out) {
+$built = @()
+foreach ($v in $toBuild) {
+  $spec = $variants[$v]
+  $out = Join-Path $OutputDir $spec.FileName
+
+  Write-Host ">>> Running makensis ($v) -> $out" -ForegroundColor Cyan
+  $nsiArgs = @(
+    "/DVERSION=$Version",
+    "/DSTAGE_DIR=$StageDir",
+    "/DOUTPUT_FILE=$out"
+  )
+  if ($spec.ModeDefine) { $nsiArgs += $spec.ModeDefine }
+  $nsiArgs += $nsi
+
+  & $Makensis @nsiArgs
+  if ($LASTEXITCODE -ne 0) { throw "makensis failed for variant '$v'" }
+
+  if (-not (Test-Path $out)) {
+    throw "makensis reported success but the output file is missing: $out"
+  }
   $size = [math]::Round(((Get-Item $out).Length / 1MB), 1)
   Write-Host ">>> Built $out (${size} MB)" -ForegroundColor Green
-} else {
-  throw "makensis reported success but the output file is missing: $out"
+  $built += [pscustomobject]@{ Variant = $v; Path = $out; SizeMB = $size }
 }
+
+Write-Host ""
+Write-Host "Built installers:" -ForegroundColor Green
+$built | Format-Table -AutoSize

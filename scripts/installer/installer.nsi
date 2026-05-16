@@ -5,16 +5,26 @@
 ; single-file publishes) + the React SPA built into wwwroot. Registers the
 ; .NET services with sc.exe and drops a browser shortcut to the local API.
 ;
-; Setup-type page offers Full (primary) vs Ingestor-only (secondary). The
-; ingestor-only path skips the API binaries and the API service registration,
-; drops a shortcut to the headless pairing PowerShell script instead.
+; Three build variants, selected by compile-time defines passed to makensis:
+;   /DMODE_FULL           Full primary install: API + Ingestor + MCP + UI.
+;   /DMODE_INGESTOR_ONLY  Secondary install: Ingestor + pairing wizard only.
+;   (neither defined)     Legacy runtime selector — user picks on a wizard page.
 ;
-; Build:  scripts/installer/build-installer.ps1 wraps publish + makensis.
+; Build:  scripts/installer/build-installer.ps1 wraps publish + makensis and by
+; default produces both variants from a single staging tree.
+;
 ; Inputs (set on the makensis command line via /D):
 ;   /DVERSION="0.2.0"
 ;   /DSTAGE_DIR="C:\path\to\scripts\installer\staging"
 ;   /DOUTPUT_FILE="C:\path\to\AIMemory_0.2.0_x64-setup.exe"
+;   /DMODE_FULL or /DMODE_INGESTOR_ONLY  (optional — see above)
 ; ============================================================================
+
+!ifdef MODE_FULL
+  !ifdef MODE_INGESTOR_ONLY
+    !error "MODE_FULL and MODE_INGESTOR_ONLY are mutually exclusive."
+  !endif
+!endif
 
 !ifndef VERSION
   !define VERSION "0.2.0"
@@ -24,11 +34,19 @@
   !error "STAGE_DIR must be set via /D — run build-installer.ps1 instead of makensis directly."
 !endif
 
-!ifndef OUTPUT_FILE
-  !define OUTPUT_FILE "AIMemory_${VERSION}_x64-setup.exe"
+!ifdef MODE_INGESTOR_ONLY
+  !define PRODUCT_NAME "AIMemory Ingestor"
+  !define DEFAULT_OUTPUT "AIMemory-Ingestor_${VERSION}_x64-setup.exe"
+!else
+  !define PRODUCT_NAME "AIMemory"
+  !define DEFAULT_OUTPUT "AIMemory_${VERSION}_x64-setup.exe"
 !endif
 
-Name "AIMemory ${VERSION}"
+!ifndef OUTPUT_FILE
+  !define OUTPUT_FILE "${DEFAULT_OUTPUT}"
+!endif
+
+Name "${PRODUCT_NAME} ${VERSION}"
 OutFile "${OUTPUT_FILE}"
 Unicode true
 InstallDir "$PROGRAMFILES64\AIMemory"
@@ -44,10 +62,15 @@ SetCompressor /SOLID lzma
 
 !define MUI_ABORTWARNING
 
-; Page order: welcome → EULA → setup-type (mode) → install dir → install → finish
+; Page order: welcome → EULA → [setup-type (mode)] → install dir → install → finish
+; SetupType page is only shown for the legacy "no compile-time mode" build.
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${STAGE_DIR}\license.txt"
-Page custom SetupTypePage SetupTypePageLeave
+!ifndef MODE_FULL
+  !ifndef MODE_INGESTOR_ONLY
+    Page custom SetupTypePage SetupTypePageLeave
+  !endif
+!endif
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -60,12 +83,20 @@ Page custom SetupTypePage SetupTypePageLeave
 ; ----------------------------- variables ------------------------------------
 
 Var InstallMode          ; "full" or "ingestor-only"
+!ifndef MODE_FULL
+!ifndef MODE_INGESTOR_ONLY
+; Only the legacy build needs these — the custom SetupType page reads/writes them.
 Var SetupTypeHwnd
 Var RadioFullHwnd
 Var RadioIngestorHwnd
+!endif
+!endif
 
 ; ----------------------------- Setup type custom page -----------------------
+; Only compiled when no compile-time MODE is forced.
 
+!ifndef MODE_FULL
+!ifndef MODE_INGESTOR_ONLY
 Function SetupTypePage
   !insertmacro MUI_HEADER_TEXT "Setup Type" "Choose how AIMemory should be installed on this machine."
 
@@ -103,32 +134,30 @@ Function SetupTypePageLeave
     StrCpy $InstallMode "full"
   ${EndIf}
 FunctionEnd
+!endif
+!endif
 
 ; ----------------------------- .NET prereq check ---------------------------
 
 Function .onInit
-  StrCpy $InstallMode "full"
+  !ifdef MODE_INGESTOR_ONLY
+    StrCpy $InstallMode "ingestor-only"
+  !else
+    StrCpy $InstallMode "full"
+  !endif
 
-  ; Probe for .NET 10. dotnet --list-runtimes is the canonical way.
-  nsExec::ExecToStack 'dotnet --list-runtimes'
-  Pop $0   ; exit code
-  Pop $1   ; output
+  ; Probe for .NET 10. cmd /c pipes `dotnet --list-runtimes` through findstr so
+  ; the exit code is 0 only when an ASP.NET Core 10.x runtime is present.
+  ; Using findstr avoids pulling in StrFunc.nsh just for one substring check.
+  nsExec::ExecToStack 'cmd /c "dotnet --list-runtimes 2>nul | findstr /B /C:\"Microsoft.NETCore.App 10.\""'
+  Pop $0   ; exit code (0 = found, 1 = not found, anything else = dotnet itself missing)
+  Pop $1   ; matching line (discarded)
   ${If} $0 != 0
-    MessageBox MB_ICONEXCLAMATION|MB_YESNO ".NET 10 runtime is required and could not be detected.$\r$\n$\r$\nOpen the .NET download page now?" IDYES openDotnetPage IDNO continueAnyway
+    MessageBox MB_ICONEXCLAMATION|MB_YESNO ".NET 10 runtime is required and was not found.$\r$\n$\r$\nOpen the .NET download page now?" IDYES openDotnetPage IDNO continueAnyway
     openDotnetPage:
       ExecShell "open" "https://dotnet.microsoft.com/download/dotnet/10.0"
       Abort
     continueAnyway:
-      Return
-  ${EndIf}
-
-  ${StrLoc} $2 $1 "Microsoft.NETCore.App 10." ">"
-  ${If} $2 == ""
-    MessageBox MB_ICONEXCLAMATION|MB_YESNO ".NET 10 runtime is required and was not found.$\r$\n$\r$\nOpen the .NET download page now?" IDYES openDotnetPage2 IDNO continueAnyway2
-    openDotnetPage2:
-      ExecShell "open" "https://dotnet.microsoft.com/download/dotnet/10.0"
-      Abort
-    continueAnyway2:
       Return
   ${EndIf}
 FunctionEnd
@@ -176,6 +205,7 @@ Section "-Ingestor" SecIngestor
   nsExec::ExecToLog 'sc.exe description "aimemory-ingestor" "Indexes code repositories and forwards events to the AIMemory API."'
 SectionEnd
 
+!ifndef MODE_INGESTOR_ONLY
 Section "-Full mode only" SecFull
   ${If} $InstallMode != "full"
     Goto skipFull
@@ -212,7 +242,9 @@ Section "-Full mode only" SecFull
 
   skipFull:
 SectionEnd
+!endif
 
+!ifndef MODE_FULL
 Section "-Ingestor-only mode" SecIngestorOnly
   ${If} $InstallMode != "ingestor-only"
     Goto skipIngestorOnly
@@ -220,13 +252,14 @@ Section "-Ingestor-only mode" SecIngestorOnly
 
   ; Pairing shortcut
   CreateDirectory "$SMPROGRAMS\AIMemory"
-  CreateShortcut "$SMPROGRAMS\AIMemory\Pair Ingestor.lnk" "powershell.exe" "-ExecutionPolicy Bypass -File \"$INSTDIR\scripts\Pair-AIMemoryIngestor.ps1\"" "$INSTDIR\Ingestor\AIMemory.Ingestor.exe" 0
+  CreateShortcut "$SMPROGRAMS\AIMemory\Pair Ingestor.lnk" "powershell.exe" "-ExecutionPolicy Bypass -File $\"$INSTDIR\scripts\Pair-AIMemoryIngestor.ps1$\"" "$INSTDIR\Ingestor\AIMemory.Ingestor.exe" 0
 
   ; Do NOT auto-start the ingestor on ingestor-only installs — config is empty,
   ; the service would just fail. The pairing script starts it on success.
 
   skipIngestorOnly:
 SectionEnd
+!endif
 
 ; ----------------------------- Uninstall ----------------------------------
 
